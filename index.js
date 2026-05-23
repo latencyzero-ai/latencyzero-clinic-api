@@ -530,6 +530,136 @@ app.get('/api/queue', async (req, res) => {
   res.json(result.rows);
 });
 
+// ─── PATCH PATIENT STATUS ─────────────────────────────
+app.patch('/api/patients/:id/status', async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  const validStatuses = ['waiting', 'seen', 'done', 'cancelled'];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE patients SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [status, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── POST QUEUE NEXT ──────────────────────────────────
+app.post('/api/queue/next', async (req, res) => {
+  try {
+    const config = await getConfig();
+
+    // Mark current as seen
+    const current = await pool.query(
+      `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
+    );
+
+    if (current.rows.length === 0) {
+      return res.json({ message: 'No patients in queue', next: null });
+    }
+
+    await pool.query(
+      `UPDATE patients SET status = 'seen', updated_at = NOW() WHERE id = $1`,
+      [current.rows[0].id]
+    );
+
+    // Get next patient
+    const next = await pool.query(
+      `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
+    );
+
+    if (next.rows.length > 0) {
+      const n = next.rows[0];
+
+      // Notify patient on WhatsApp
+      await sendWhatsApp(n.phone,
+        `🔔 *Hi ${n.name}!* It's your turn!\n\nPlease proceed to the consultation room. The doctor is ready for you. 🏥\n\n_— Zero_`
+      );
+
+      // Notify clinic
+      await notifyClinic('next', {
+        queueNumber: n.queue_number,
+        name: n.name,
+        department: n.department,
+        complaint: n.complaint
+      }, config);
+
+      return res.json({
+        message: 'Queue advanced',
+        previous: current.rows[0],
+        next: next.rows[0]
+      });
+    }
+
+    res.json({
+      message: 'No more patients in queue',
+      previous: current.rows[0],
+      next: null
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── GET TODAY'S STATS ────────────────────────────────
+app.get('/api/stats/today', async (req, res) => {
+  try {
+    const total = await pool.query(
+      `SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`
+    );
+    const waiting = await pool.query(
+      `SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting'`
+    );
+    const seen = await pool.query(
+      `SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`
+    );
+    const appointments = await pool.query(
+      `SELECT COUNT(*) FROM appointments WHERE DATE(created_at) = CURRENT_DATE`
+    );
+    const avgWait = await pool.query(
+      `SELECT ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))/60)) as avg_minutes
+       FROM patients 
+       WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`
+    );
+
+    res.json({
+      total: parseInt(total.rows[0].count),
+      waiting: parseInt(waiting.rows[0].count),
+      seen: parseInt(seen.rows[0].count),
+      appointments: parseInt(appointments.rows[0].count),
+      avg_wait_minutes: parseInt(avgWait.rows[0].avg_minutes) || 0
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── GET ACTIVE PATIENTS ──────────────────────────────
+app.get('/api/patients/active', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM patients 
+       WHERE DATE(created_at) = CURRENT_DATE 
+       AND status = 'waiting'
+       ORDER BY queue_number ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/appointments', async (req, res) => {
   const result = await pool.query(
     `SELECT * FROM appointments ORDER BY created_at DESC`
