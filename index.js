@@ -187,7 +187,15 @@ You need to collect this information from patients:
 - symptoms (detailed description)
 - If appointment: appointment_date and appointment_time
 
-Already collected: ${JSON.stringify(collectedData)}
+Already collected from this patient: ${JSON.stringify(collectedData)}
+
+IMPORTANT RULES ABOUT HISTORY:
+- Read the FULL conversation history above carefully before responding
+- Extract ANY information the patient mentioned at ANY point in the conversation
+- "I don't feel well", "I have a headache", "my stomach hurts" ALL count as complaint
+- If patient says "already told you" — search the history and find what they said
+- Never ask for something already mentioned anywhere in the conversation
+- Connect information across messages e.g. "I don't feel well" + "I'd like to come in tomorrow" = complaint + appointment mode
 
 Rules:
 1. Be warm, friendly and conversational like a real person
@@ -328,7 +336,7 @@ async function processMessage(phone, message) {
   history.push({ role: 'user', content: message });
 
   // Call Zero AI brain
-  const aiResponse = await zeroAI(message, history.slice(-10), data, config);
+  const aiResponse = await zeroAI(message, history.slice(-20), data, config);
 
   // Merge extracted data
   if (aiResponse.extracted) {
