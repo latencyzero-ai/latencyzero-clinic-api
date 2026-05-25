@@ -26,12 +26,9 @@ function getGreeting() {
 async function getConfig() {
   const result = await pool.query('SELECT * FROM clinic_config LIMIT 1');
   const config = result.rows[0] || { clinic_name: 'Our Clinic', agent_name: 'Zero' };
-  
-  // Ensure services is always an array
   if (!config.services || !Array.isArray(config.services)) {
     config.services = ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
   }
-  
   return config;
 }
 
@@ -176,48 +173,107 @@ async function notifyClinic(type, data, config) {
   }
 }
 
+// ─── APPOINTMENT REMINDER ─────────────────────────────
+async function checkAndSendReminders() {
+  try {
+    const now = new Date();
+    const thirtyMinsLater = new Date(now.getTime() + 30 * 60 * 1000);
+
+    const result = await pool.query(
+      `SELECT * FROM appointments 
+       WHERE status = 'scheduled'
+       AND appointment_time > $1 
+       AND appointment_time <= $2`,
+      [now.toTimeString().slice(0, 8), thirtyMinsLater.toTimeString().slice(0, 8)]
+    );
+
+    for (const appt of result.rows) {
+      const cfg = await getConfig();
+      const message =
+        `⏰ *Reminder from Zero!*\n\n` +
+        `Hi *${appt.name}*! Your appointment at *${cfg.clinic_name}* ` +
+        `is in 30 minutes.\n\n` +
+        `Are you:\n` +
+        `1️⃣ On my way / Already here\n` +
+        `2️⃣ Cancel appointment\n\n` +
+        `_Please reply so we can prepare for you._`;
+
+      await sendWhatsApp(appt.phone, message);
+
+      await pool.query(
+        `UPDATE appointments SET status = 'reminder_sent' WHERE id = $1`,
+        [appt.id]
+      );
+
+      console.log(`Reminder sent to ${appt.name} — ${appt.phone}`);
+    }
+  } catch (e) {
+    console.log('Reminder error:', e.message);
+  }
+}
+
+setInterval(checkAndSendReminders, 5 * 60 * 1000);
+
 // ─── ZERO AI BRAIN ────────────────────────────────────
 async function zeroAI(message, history, collectedData, config) {
   const systemPrompt = `You are Zero, a warm and intelligent clinic assistant for ${config.clinic_name}.
 You help patients register and book appointments through WhatsApp.
 
+CONVERSATION ORDER — STRICTLY FOLLOW THIS SEQUENCE:
+Step 1: Collect BASIC DETAILS first (name, age, gender) — ask naturally, can be in one or two messages
+Step 2: Collect MEDICAL DETAILS (complaint, symptoms) — ask how they feel, what brought them in
+Step 3: ONLY AFTER collecting all medical details — ask HOW they plan to visit:
+
+"How do you plan to visit us today?
+1️⃣ I'm already at the clinic
+2️⃣ I'm on my way
+3️⃣ I'd like to book an appointment"
+
+NEVER ask about visit mode before collecting name, age, gender, complaint and symptoms.
+
 WHAT YOU NEED TO COLLECT:
 - name: patient's full name
-- age: number only (extract from "I'm 28", "28 years old", "age is 28" etc)
+- age: number only (extract from "I'm 28", "28 years old" etc)
 - gender: Male/Female/Prefer not to say (accept m/f/male/female/1/2/3)
-- mode: HOW they are visiting:
+- complaint: main reason for visit
+- symptoms: detailed description including duration, severity
+- mode: HOW they are visiting (collected LAST):
     "walkin" = at the clinic right now
-    "onmyway" = coming to clinic soon  
+    "onmyway" = coming to clinic soon
     "appointment" = booking for future date
-- complaint: main reason for visit (extract from "I don't feel well", "I have a headache" etc)
-- symptoms: detailed description of how they feel
 - appointment_date: only if mode is appointment
 - appointment_time: only if mode is appointment
 
 ALREADY COLLECTED FROM THIS PATIENT:
 ${JSON.stringify(collectedData)}
 
+APPOINTMENT ARRIVAL DETECTION:
+If a patient says they have arrived, they're here, or they're at the clinic AND they already have an appointment in the system — set mode to "walkin" and is_complete to true so they get a queue number assigned.
+
+APPOINTMENT REMINDER RESPONSE:
+If a patient responds to a reminder message saying they're coming or they're here — set mode to "walkin" and is_complete to true.
+If they say cancel — set intent to "cancel_appointment".
+
 CRITICAL RULES:
 1. Read the FULL conversation history — extract info from ANY previous message
 2. NEVER ask for information already collected or mentioned anywhere in history
-3. "I don't feel well" = complaint. Ask for MORE detail as symptoms
-4. "I'm already here/at the clinic" = mode walkin
-5. "I'm coming/on my way" = mode onmyway  
-6. "I want to book/appointment/tomorrow/next week" = mode appointment
-7. Extract name AND age AND mode from a single message if patient provides them
-8. Use patient's name naturally once you know it
-9. Ask for maximum 2 pieces of missing info at a time
-10. Keep responses SHORT and friendly — this is WhatsApp not email
-11. When you have name + age + gender + mode + complaint + symptoms → set is_complete to TRUE
-12. For appointments also need appointment_date + appointment_time before is_complete
+3. Follow the 3-step sequence strictly — basic details → medical details → visit mode
+4. Extract name AND age AND gender from a single message if patient provides them
+5. Use patient's name naturally once you know it
+6. Ask for maximum 2 pieces of missing info at a time
+7. Keep responses SHORT and friendly — this is WhatsApp not email
+8. When you have name + age + gender + complaint + symptoms + mode → set is_complete to TRUE
+9. For appointments also need appointment_date + appointment_time before is_complete
+10. Always present the 3 visit mode options clearly when asking about visit type
 
 INTENT DETECTION — ONLY set these for EXACT phrases:
 - "doctor_done": ONLY if message is exactly "done", "next", "next patient", "mark done", "mark complete"
-- "restart": ONLY if message is "restart", "start over", "reset", "menu"  
+- "restart": ONLY if message is "restart", "start over", "reset", "menu"
 - "check_queue": ONLY if message is "queue", "check queue", "my number", "queue status"
+- "cancel_appointment": ONLY if patient explicitly says cancel their appointment
 - "collecting": everything else — normal conversation
 
-DO NOT set doctor_done for phrases like "that's all", "no", "nothing else", "I'm done" — those are just conversation endings.
+DO NOT set doctor_done for phrases like "that's all", "no", "nothing else", "I'm done".
 
 RESPOND ONLY WITH THIS JSON — no other text:
 {
@@ -327,45 +383,41 @@ async function processMessage(phone, message) {
 
   const msg = message.trim().toLowerCase();
 
+  // ─── BUILD WELCOME MESSAGE ────────────────────────
+  const buildWelcome = (isReturn = false) => {
+    const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
+    const emojis = ['🏥', '🦷', '❤️', '🧠', '🔬'];
+    const serviceList = services.map((s, i) => `${emojis[i] || '⚕️'} ${s}`).join('\n');
+    return `${greeting}! 👋 I'm *${config.agent_name}*, your clinic assistant.\n\n` +
+      `Welcome${isReturn ? ' back' : ''} to *${config.clinic_name}*!\n\n` +
+      `Here are the services we offer:\n${serviceList}\n\n` +
+      `I can help you with:\n` +
+      `1️⃣ Walk-in registration\n` +
+      `2️⃣ Book an appointment\n` +
+      `3️⃣ Let us know you're on your way\n` +
+      `4️⃣ Check your queue status\n\n` +
+      `How can I help you today?`;
+  };
+
   // ── RESTART ──
   if (['restart', 'reset', 'start over', 'menu'].includes(msg)) {
-    const welcomeMsg =
-      `${greeting}! 👋 I'm *Zero*, your clinic assistant.\n\n` +
-      `Welcome back to *${config.clinic_name}*!\n\n` +
-      `How can I help you today?`;
+    const welcomeMsg = buildWelcome(true);
     await updateConversation(phone, 'ACTIVE', { phone, history: [{ role: 'assistant', content: welcomeMsg }] });
     return welcomeMsg;
   }
 
   // ── FIRST TIME ──
-if (conv.state === 'START') {
-  console.log('Config services:', config.services);
-  const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
-  const serviceList = services.map((s, i) => `${['🏥','🦷','❤️','🧠','🔬'][i] || '⚕️'} ${s}`).join('\n');
-
-  const welcomeMsg =
-    `${greeting}! 👋 I'm *Zero*, your clinic assistant.\n\n` +
-    `Welcome to *${config.clinic_name}*!\n\n` +
-    `Here are the services we offer:\n${serviceList}\n\n` +
-    `I can help you with:\n` +
-    `1️⃣ Walk-in registration\n` +
-    `2️⃣ Book an appointment\n` +
-    `3️⃣ Let us know you're on your way\n` +
-    `4️⃣ Check your queue status\n\n` +
-    `How can I help you today?`;
-    
-    // Process their first message immediately after welcome
+  if (conv.state === 'START') {
+    const welcomeMsg = buildWelcome(false);
     history = [{ role: 'assistant', content: welcomeMsg }];
     data.history = history;
     await updateConversation(phone, 'ACTIVE', data);
 
-    // If first message is just a greeting return welcome only
     const greetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'hii', 'helo'];
     if (greetings.some(g => msg.includes(g)) && msg.length < 20) {
       return welcomeMsg;
     }
 
-    // Otherwise process their first message immediately
     history.push({ role: 'user', content: message });
     const aiResponse = await zeroAI(message, history, data, config);
 
@@ -416,6 +468,15 @@ if (conv.state === 'START') {
     data.history = history.slice(-20);
     await updateConversation(phone, 'ACTIVE', data);
     return reply;
+  }
+
+  if (aiResponse.intent === 'cancel_appointment') {
+    await pool.query(
+      `UPDATE appointments SET status = 'cancelled' WHERE phone = $1 AND status IN ('scheduled', 'reminder_sent')`,
+      [phone]
+    );
+    await updateConversation(phone, 'START', {});
+    return `Your appointment has been cancelled${data.name ? ', ' + data.name : ''}. 😊\n\nWe hope to see you another time. If you need to rebook just message us again.\n\n_— Zero_`;
   }
 
   if (aiResponse.intent === 'doctor_done') {
@@ -532,8 +593,6 @@ app.post('/webhook/whatsapp', async (req, res) => {
 });
 
 // ─── API ENDPOINTS ────────────────────────────────────
-
-// ── MUST BE BEFORE :id ROUTES ──
 app.get('/api/patients/active', async (req, res) => {
   try {
     const result = await pool.query(
