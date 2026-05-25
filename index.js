@@ -332,10 +332,18 @@ async function processMessage(phone, message) {
 
   // ── FIRST TIME ──
   if (conv.state === 'START') {
+    const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
+    const serviceList = services.map((s, i) => `${['🏥','🦷','❤️','🧠','🔬'][i] || '⚕️'} ${s}`).join('\n');
+
     const welcomeMsg =
       `${greeting}! 👋 I'm *Zero*, your clinic assistant.\n\n` +
       `Welcome to *${config.clinic_name}*!\n\n` +
-      `I'm here to help you register, book an appointment, or check your queue status.\n\n` +
+      `Here are the services we offer:\n${serviceList}\n\n` +
+      `I can help you with:\n` +
+      `1️⃣ Walk-in registration\n` +
+      `2️⃣ Book an appointment\n` +
+      `3️⃣ Let us know you're on your way\n` +
+      `4️⃣ Check your queue status\n\n` +
       `How can I help you today?`;
 
     // Process their first message immediately after welcome
