@@ -25,7 +25,14 @@ function getGreeting() {
 // ─── GET CLINIC CONFIG ────────────────────────────────
 async function getConfig() {
   const result = await pool.query('SELECT * FROM clinic_config LIMIT 1');
-  return result.rows[0] || { clinic_name: 'Our Clinic', agent_name: 'Zero' };
+  const config = result.rows[0] || { clinic_name: 'Our Clinic', agent_name: 'Zero' };
+  
+  // Ensure services is always an array
+  if (!config.services || !Array.isArray(config.services)) {
+    config.services = ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
+  }
+  
+  return config;
 }
 
 // ─── GET CONVERSATION ─────────────────────────────────
@@ -331,21 +338,22 @@ async function processMessage(phone, message) {
   }
 
   // ── FIRST TIME ──
-  if (conv.state === 'START') {
-    const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
-    const serviceList = services.map((s, i) => `${['🏥','🦷','❤️','🧠','🔬'][i] || '⚕️'} ${s}`).join('\n');
+if (conv.state === 'START') {
+  console.log('Config services:', config.services);
+  const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
+  const serviceList = services.map((s, i) => `${['🏥','🦷','❤️','🧠','🔬'][i] || '⚕️'} ${s}`).join('\n');
 
-    const welcomeMsg =
-      `${greeting}! 👋 I'm *Zero*, your clinic assistant.\n\n` +
-      `Welcome to *${config.clinic_name}*!\n\n` +
-      `Here are the services we offer:\n${serviceList}\n\n` +
-      `I can help you with:\n` +
-      `1️⃣ Walk-in registration\n` +
-      `2️⃣ Book an appointment\n` +
-      `3️⃣ Let us know you're on your way\n` +
-      `4️⃣ Check your queue status\n\n` +
-      `How can I help you today?`;
-
+  const welcomeMsg =
+    `${greeting}! 👋 I'm *Zero*, your clinic assistant.\n\n` +
+    `Welcome to *${config.clinic_name}*!\n\n` +
+    `Here are the services we offer:\n${serviceList}\n\n` +
+    `I can help you with:\n` +
+    `1️⃣ Walk-in registration\n` +
+    `2️⃣ Book an appointment\n` +
+    `3️⃣ Let us know you're on your way\n` +
+    `4️⃣ Check your queue status\n\n` +
+    `How can I help you today?`;
+    
     // Process their first message immediately after welcome
     history = [{ role: 'assistant', content: welcomeMsg }];
     data.history = history;
