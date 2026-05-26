@@ -219,74 +219,54 @@ async function zeroAI(message, history, collectedData, config) {
   const systemPrompt = `You are Zero, a warm and intelligent clinic assistant for ${config.clinic_name}.
 You help patients register and book appointments through WhatsApp.
 
-CONVERSATION ORDER — STRICTLY FOLLOW THIS SEQUENCE:
-Step 1: Collect BASIC DETAILS first (name, age, gender) — ask naturally, can be in one or two messages
-Step 2: Collect MEDICAL DETAILS (complaint, symptoms) — ask how they feel, what brought them in
-Step 3: ONLY AFTER collecting all medical details — ask HOW they plan to visit:
-
-"How do you plan to visit us today?
-1️⃣ I'm already at the clinic
-2️⃣ I'm on my way
-3️⃣ I'd like to book an appointment"
-
-NEVER ask about visit mode before collecting name, age, gender, complaint and symptoms.
-
-WHAT YOU NEED TO COLLECT:
-- name: patient's full name
-- age: number only (extract from "I'm 28", "28 years old" etc)
-- gender: Male/Female/Prefer not to say (accept m/f/male/female/1/2/3)
-- complaint: main reason for visit
-- symptoms: detailed description including duration, severity
-- mode: HOW they are visiting (collected LAST):
-    "walkin" = at the clinic right now
-    "onmyway" = coming to clinic soon
-    "appointment" = booking for future date
-- appointment_date: only if mode is appointment
-- appointment_time: only if mode is appointment
-
-ALREADY COLLECTED FROM THIS PATIENT:
+CURRENT PATIENT DATA ALREADY COLLECTED:
 ${JSON.stringify(collectedData)}
 
-APPOINTMENT ARRIVAL DETECTION:
-If a patient says they have arrived, they're here, or they're at the clinic AND they already have an appointment in the system — set mode to "walkin" and is_complete to true so they get a queue number assigned.
+YOUR ONLY JOB:
+Look at what is already collected above. Figure out what is STILL MISSING. Ask for ONLY the missing information.
 
-APPOINTMENT REMINDER RESPONSE:
-If a patient responds to a reminder message saying they're coming or they're here — set mode to "walkin" and is_complete to true.
-If they say cancel — set intent to "cancel_appointment".
+WHAT YOU NEED TO COLLECT:
+- name: patient full name
+- age: number (extract from "I'm 45", "45 years old", "age 45" etc)
+- gender: Male/Female/Prefer not to say (accept m/f/1/2/3/male/female)
+- complaint: main reason for visit (e.g. "chest pain", "toothache")
+- symptoms: more detail about how they feel (duration, severity, other symptoms)
+- appointment_date: ONLY if mode is "appointment" — accept ANY format like "tomorrow", "Monday", "26th May", "today"
+- appointment_time: ONLY if mode is "appointment" — accept ANY format like "4pm", "9am", "morning", "afternoon"
 
-CRITICAL RULES:
-1. Read the FULL conversation history — extract info from ANY previous message
-2. NEVER ask for information already collected or mentioned anywhere in history
-3. Follow the 3-step sequence strictly — basic details → medical details → visit mode
-4. Extract name AND age AND gender from a single message if patient provides them. If patient only gives name, ask specifically for age and gender before moving to medical questions. Do NOT proceed to complaint without age and gender.
-5. Use patient's name naturally once you know it
-6. Ask for maximum 2 pieces of missing info at a time
-7. Keep responses SHORT and friendly — this is WhatsApp not email
-8. When you have name + age + gender + complaint + symptoms + mode → IMMEDIATELY set is_complete to TRUE in your JSON response. Do not say "I've taken note" and wait. Complete registration right away.
-9. For appointments — after getting symptoms ask clearly: "What date and time would you like to come in?" to collect both at once. If patient gives only time, ask for date. If patient gives only date, ask for time. NEVER confirm appointment without both.
-10. Always present the 3 visit mode options clearly when asking about visit type.
-11. If mode was already established earlier (patient selected 1, 2, or 3 from the menu) — the moment you have name + age + gender + complaint + symptoms, set is_complete to TRUE immediately. Never leave the patient waiting.
-12. Never end a response with a statement like "I've taken note" or "I have your details" without either asking the next question or completing registration.
-13. If patient says something rude, frustrated or off-topic — respond with calm empathy and redirect gently. Never crash or give up. Example: "I understand this can be a bit much. Let me help you quickly — [ask next question]"
-14. If mode is already set in ALREADY COLLECTED data — NEVER ask how they plan to visit again. Skip straight to collecting any remaining missing information.
+NOTE: "mode" is already set in the collected data above. You NEVER need to ask about mode.
 
-INTENT DETECTION — ONLY set these for EXACT phrases:
-- "doctor_done": ONLY if message is exactly "done", "next", "next patient", "mark done", "mark complete"
-- "restart": ONLY if message is "restart", "start over", "reset", "menu"
-- "check_queue": ONLY if message is "queue", "check queue", "my number", "queue status"
-- "cancel_appointment": ONLY if patient explicitly says cancel their appointment
-- "collecting": everything else — normal conversation
+COLLECTION ORDER:
+1. First collect: name, age, gender (can be in one message)
+2. Then collect: complaint
+3. Then collect: symptoms (more detail)
+4. If mode is "appointment": collect appointment_date, then appointment_time
+5. Once everything is collected: set is_complete to TRUE
 
-DO NOT set doctor_done for phrases like "that's all", "no", "nothing else", "I'm done".
+RULES:
+1. NEVER ask for anything already in CURRENT PATIENT DATA
+2. NEVER ask about how they plan to visit — mode is already known
+3. Extract info from ANY part of the message even if phrased unusually
+4. appointment_date and appointment_time are plain text — accept anything the patient writes
+5. Use patient name naturally once known
+6. Keep messages SHORT — this is WhatsApp
+7. If patient seems frustrated or confused — be calm, apologize briefly and ask the next question simply
+8. When ALL required fields are collected — set is_complete to TRUE immediately
 
-RESPOND ONLY WITH THIS JSON — no other text:
+INTENT DETECTION:
+- "doctor_done": message is exactly "done", "next", "next patient", "mark done", "mark complete"
+- "restart": message is "restart", "start over", "reset", "menu"
+- "check_queue": message is "queue", "check queue", "my number", "queue status"
+- "cancel_appointment": patient explicitly says cancel appointment
+- "collecting": everything else
+
+RESPOND ONLY WITH THIS JSON:
 {
-  "reply": "your warm friendly WhatsApp response",
+  "reply": "your short warm WhatsApp response",
   "extracted": {
     "name": null,
     "age": null,
     "gender": null,
-    "mode": null,
     "complaint": null,
     "symptoms": null,
     "appointment_date": null,
@@ -296,8 +276,7 @@ RESPOND ONLY WITH THIS JSON — no other text:
   "intent": "collecting"
 }
 
-Only put values in extracted that you ACTUALLY found in the current or previous messages.
-Set is_complete to TRUE when you have ALL required fields for the patient's mode.`;
+Only include extracted fields you ACTUALLY found. Set is_complete TRUE only when all required fields exist.`;
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -364,15 +343,47 @@ async function savePatient(data, queueNumber, routing) {
 
 // ─── SAVE APPOINTMENT ─────────────────────────────────
 async function saveAppointment(data, routing) {
+  // Store date and time as plain text — no parsing
   const result = await pool.query(
     `INSERT INTO appointments 
-     (phone, name, age, gender, complaint, department, appointment_date, appointment_time)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-    [data.phone, data.name, data.age, data.gender,
-     data.complaint, routing.department,
-     data.appointment_date, data.appointment_time]
+     (phone, name, age, gender, complaint, department, appointment_date, appointment_time, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'scheduled') RETURNING *`,
+    [
+      data.phone,
+      data.name,
+      data.age,
+      data.gender,
+      data.complaint,
+      routing.department,
+      data.appointment_date,
+      data.appointment_time
+    ]
   );
   return result.rows[0];
+}
+
+// ─── BUILD WELCOME MESSAGE ────────────────────────────
+function buildWelcome(config, greeting, isReturn = false) {
+  const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
+  const emojis = ['🏥', '🦷', '❤️', '🧠', '🔬'];
+  const serviceList = services.map((s, i) => `${emojis[i] || '⚕️'} ${s}`).join('\n');
+  return `${greeting}! 👋 I'm *${config.agent_name}*, your clinic assistant.\n\n` +
+    `Welcome${isReturn ? ' back' : ''} to *${config.clinic_name}*!\n\n` +
+    `Here are the services we offer:\n${serviceList}\n\n` +
+    `How can I help you today?\n\n` +
+    `1️⃣ Walk-in registration\n` +
+    `2️⃣ Book an appointment\n` +
+    `3️⃣ I'm on my way to the clinic\n` +
+    `4️⃣ Check my queue status`;
+}
+
+// ─── DETECT MENU SELECTION ────────────────────────────
+function detectMenuSelection(msg) {
+  if (msg === '1' || msg.includes('walk') || msg.includes('already at') || msg.includes('at the clinic')) return 'walkin';
+  if (msg === '2' || msg.includes('book') || msg.includes('appointment') || msg.includes('schedule')) return 'appointment';
+  if (msg === '3' || msg.includes('on my way') || msg.includes('coming') || msg.includes('otw')) return 'onmyway';
+  if (msg === '4' || msg.includes('queue') || msg.includes('my number') || msg.includes('status')) return 'check_queue';
+  return null;
 }
 
 // ─── PROCESS MESSAGE ──────────────────────────────────
@@ -387,114 +398,61 @@ async function processMessage(phone, message) {
 
   const msg = message.trim().toLowerCase();
 
-  // ─── BUILD WELCOME MESSAGE ────────────────────────
-  const buildWelcome = (isReturn = false) => {
-    const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
-    const emojis = ['🏥', '🦷', '❤️', '🧠', '🔬'];
-    const serviceList = services.map((s, i) => `${emojis[i] || '⚕️'} ${s}`).join('\n');
-    return `${greeting}! 👋 I'm *${config.agent_name}*, your clinic assistant.\n\n` +
-      `Welcome${isReturn ? ' back' : ''} to *${config.clinic_name}*!\n\n` +
-      `Here are the services we offer:\n${serviceList}\n\n` +
-      `I can help you with:\n` +
-      `1️⃣ Walk-in registration\n` +
-      `2️⃣ Book an appointment\n` +
-      `3️⃣ Let us know you're on your way\n` +
-      `4️⃣ Check your queue status\n\n` +
-      `How can I help you today?`;
-  };
-
   // ── RESTART ──
   if (['restart', 'reset', 'start over', 'menu'].includes(msg)) {
-    const welcomeMsg = buildWelcome(true);
-    await updateConversation(phone, 'ACTIVE', { phone, history: [{ role: 'assistant', content: welcomeMsg }] });
+    const welcomeMsg = buildWelcome(config, greeting, true);
+    await updateConversation(phone, 'START', {});
     return welcomeMsg;
   }
 
-  // ── FIRST TIME ──
+  // ── FIRST TIME / SHOW WELCOME ──
   if (conv.state === 'START') {
-    const welcomeMsg = buildWelcome(false);
+    const welcomeMsg = buildWelcome(config, greeting, false);
     history = [{ role: 'assistant', content: welcomeMsg }];
     data.history = history;
-    await updateConversation(phone, 'ACTIVE', data);
-
-    const greetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'hii', 'helo'];
-    if (greetings.some(g => msg.includes(g)) && msg.length < 20) {
-      return welcomeMsg;
-    }
-
-    history.push({ role: 'user', content: message });
-    const aiResponse = await zeroAI(message, history, data, config);
-
-    if (aiResponse.extracted) {
-      Object.keys(aiResponse.extracted).forEach(key => {
-        if (aiResponse.extracted[key] !== null && aiResponse.extracted[key] !== undefined) {
-          data[key] = aiResponse.extracted[key];
-        }
-      });
-    }
-
-    history.push({ role: 'assistant', content: aiResponse.reply });
-    data.history = history.slice(-20);
-    await updateConversation(phone, 'ACTIVE', data);
-    return aiResponse.reply;
+    await updateConversation(phone, 'MENU', data);
+    return welcomeMsg;
   }
 
-  // ── ADD MESSAGE TO HISTORY ──
-  history.push({ role: 'user', content: message });
+  // ── MENU STATE — waiting for selection ──
+  if (conv.state === 'MENU') {
+    const selection = detectMenuSelection(msg);
 
-  // ── DETECT MENU SELECTION ──
-if (conv.state === 'ACTIVE' && !data.mode) {
-  if (msg === '1' || msg === 'walk-in' || msg === 'walk in') {
-    data.mode = 'walkin';
-  } else if (msg === '2' || msg === 'appointment' || msg === 'book') {
-    data.mode = 'appointment';
-  } else if (msg === '3' || msg === 'on my way' || msg === 'onmyway') {
-    data.mode = 'onmyway';
-  }
-}
-
-  // ── CALL ZERO AI ──
-  const aiResponse = await zeroAI(message, history.slice(-20), data, config);
-
-  // ── MERGE EXTRACTED DATA ──
-  if (aiResponse.extracted) {
-    Object.keys(aiResponse.extracted).forEach(key => {
-      if (aiResponse.extracted[key] !== null && aiResponse.extracted[key] !== undefined) {
-        data[key] = aiResponse.extracted[key];
+    if (selection === 'check_queue') {
+      const patient = await pool.query(
+        'SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']
+      );
+      if (patient.rows.length > 0) {
+        const p = patient.rows[0];
+        return `Your queue status:\n\n🔢 Queue Number: *#${p.queue_number}*\n🏥 Department: *${p.department}*\n⏳ Status: *Waiting*\n\nPlease remain seated. I'll notify you when it's your turn! 😊`;
       }
-    });
-  }
+      return `You don't have an active queue number yet.\n\nWould you like to register? Reply *1* for walk-in or *2* to book an appointment.`;
+    }
 
-  // ── HANDLE INTENTS ──
-  if (aiResponse.intent === 'check_queue') {
-    const patient = await pool.query(
-      'SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']
-    );
-    if (patient.rows.length > 0) {
-      const p = patient.rows[0];
-      const reply = `Your current queue status:\n\n🔢 Queue Number: *#${p.queue_number}*\n🏥 Department: *${p.department}*\n⏳ Status: *Waiting*\n\nPlease remain seated. I'll notify you when it's your turn! 😊`;
-      history.push({ role: 'assistant', content: reply });
+    if (selection) {
+      data.mode = selection;
+      history.push({ role: 'user', content: message });
+
+      let modeReply = '';
+      if (selection === 'walkin') modeReply = `Great! Let's get you registered quickly. 😊\n\nCould you share your *full name, age and gender*?`;
+      if (selection === 'appointment') modeReply = `I'll help you book an appointment! 📅\n\nCould you share your *full name, age and gender*?`;
+      if (selection === 'onmyway') modeReply = `Got it! Let's take your details so the clinic is ready when you arrive. 🚗\n\nCould you share your *full name, age and gender*?`;
+
+      history.push({ role: 'assistant', content: modeReply });
       data.history = history.slice(-20);
       await updateConversation(phone, 'ACTIVE', data);
-      return reply;
+      return modeReply;
     }
-    const reply = `You don't have an active queue number yet.\n\nWould you like to register as a walk-in patient?`;
-    history.push({ role: 'assistant', content: reply });
-    data.history = history.slice(-20);
-    await updateConversation(phone, 'ACTIVE', data);
-    return reply;
+
+    // No valid selection — show menu again
+    return buildWelcome(config, greeting, false);
   }
 
-  if (aiResponse.intent === 'cancel_appointment') {
-    await pool.query(
-      `UPDATE appointments SET status = 'cancelled' WHERE phone = $1 AND status IN ('scheduled', 'reminder_sent')`,
-      [phone]
-    );
-    await updateConversation(phone, 'START', {});
-    return `Your appointment has been cancelled${data.name ? ', ' + data.name : ''}. 😊\n\nWe hope to see you another time. If you need to rebook just message us again.\n\n_— Zero_`;
-  }
+  // ── ACTIVE — collecting patient info ──
+  history.push({ role: 'user', content: message });
 
-  if (aiResponse.intent === 'doctor_done') {
+  // Check for special intents first
+  if (msg === 'done' || msg === 'next' || msg === 'next patient' || msg === 'mark done' || msg === 'mark complete') {
     const current = await pool.query(
       `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
     );
@@ -523,10 +481,43 @@ if (conv.state === 'ACTIVE' && !data.mode) {
     return `No active patients in the queue.`;
   }
 
+  if (msg === 'queue' || msg === 'check queue' || msg === 'my number' || msg === 'queue status') {
+    const patient = await pool.query(
+      'SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']
+    );
+    if (patient.rows.length > 0) {
+      const p = patient.rows[0];
+      return `Your queue status:\n\n🔢 Queue Number: *#${p.queue_number}*\n🏥 Department: *${p.department}*\n⏳ Status: *Waiting*\n\nPlease remain seated! 😊`;
+    }
+    return `You don't have an active queue number yet.`;
+  }
+
+  // ── CALL ZERO AI ──
+  const aiResponse = await zeroAI(message, history.slice(-20), data, config);
+
+  // ── MERGE EXTRACTED DATA ──
+  if (aiResponse.extracted) {
+    Object.keys(aiResponse.extracted).forEach(key => {
+      if (aiResponse.extracted[key] !== null && aiResponse.extracted[key] !== undefined) {
+        data[key] = aiResponse.extracted[key];
+      }
+    });
+  }
+
+  // ── CANCEL APPOINTMENT ──
+  if (aiResponse.intent === 'cancel_appointment') {
+    await pool.query(
+      `UPDATE appointments SET status = 'cancelled' WHERE phone = $1 AND status IN ('scheduled', 'reminder_sent')`,
+      [phone]
+    );
+    await updateConversation(phone, 'START', {});
+    return `Your appointment has been cancelled${data.name ? ', ' + data.name : ''}. 😊\n\nWe hope to see you another time. Message us anytime to rebook.\n\n_— Zero_`;
+  }
+
   // ── HANDLE COMPLETE INTAKE ──
   if (aiResponse.is_complete) {
 
-    // ── GLOBAL SAFETY CHECKS ──
+    // Safety checks
     if (!data.name || !data.age || !data.gender) {
       const reply = `I still need a few details. Could you share your full name, age and gender?`;
       history.push({ role: 'assistant', content: reply });
@@ -535,39 +526,39 @@ if (conv.state === 'ACTIVE' && !data.mode) {
       return reply;
     }
 
-    if (!data.complaint || !data.symptoms) {
-      const reply = `Could you tell me more about what brought you in today, ${data.name}? What are you experiencing?`;
+    if (!data.complaint) {
+      const reply = `What brings you to the clinic today, ${data.name}?`;
       history.push({ role: 'assistant', content: reply });
       data.history = history.slice(-20);
       await updateConversation(phone, 'ACTIVE', data);
       return reply;
     }
 
-    if (!data.mode) {
-      const reply = `How do you plan to visit us today, ${data.name}?\n\n1️⃣ I'm already at the clinic\n2️⃣ I'm on my way\n3️⃣ I'd like to book an appointment`;
+    if (!data.symptoms) {
+      const reply = `Can you describe your symptoms in a bit more detail, ${data.name}?`;
       history.push({ role: 'assistant', content: reply });
       data.history = history.slice(-20);
       await updateConversation(phone, 'ACTIVE', data);
       return reply;
     }
-
-    const routing = await getAIRouting(data.complaint, data.symptoms || '');
 
     if (data.mode === 'appointment') {
       if (!data.appointment_date) {
-        const reply = `Almost there, ${data.name}! 😊\n\nWhat date would you like to come in?\n\n_(e.g. "Tomorrow", "Monday", "27th May")_`;
+        const reply = `What date would you like to come in, ${data.name}?\n_(e.g. "Tomorrow", "Monday", "27th May")_`;
         history.push({ role: 'assistant', content: reply });
         data.history = history.slice(-20);
         await updateConversation(phone, 'ACTIVE', data);
         return reply;
       }
       if (!data.appointment_time) {
-        const reply = `And what time works best for you, ${data.name}?\n\n_(e.g. "9am", "2:30pm", "afternoon")_`;
+        const reply = `And what time works for you?\n_(e.g. "9am", "2pm", "afternoon")_`;
         history.push({ role: 'assistant', content: reply });
         data.history = history.slice(-20);
         await updateConversation(phone, 'ACTIVE', data);
         return reply;
       }
+
+      const routing = await getAIRouting(data.complaint, data.symptoms || '');
       await saveAppointment(data, routing);
       await notifyClinic('appointment', {
         name: data.name, age: data.age, gender: data.gender,
@@ -584,6 +575,8 @@ if (conv.state === 'ACTIVE' && !data.mode) {
         `The clinic has been notified. Please arrive 10 minutes early.\n\n` +
         `_See you soon! — Zero_ 🤖`;
     }
+
+    const routing = await getAIRouting(data.complaint, data.symptoms || '');
 
     if (data.mode === 'onmyway') {
       await notifyClinic('onmyway', {
@@ -643,7 +636,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     console.error('Error:', error.message);
     res.set('Content-Type', 'text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
-      <Response><Message>I'm sorry I couldn't understand that. 😊 Please try again or speak to reception for help.\n\n_— Zero_</Message></Response>`);
+      <Response><Message>Sorry, something went wrong. Please try again or speak to reception. 😊\n\n_— Zero_</Message></Response>`);
   }
 });
 
@@ -664,22 +657,13 @@ app.get('/api/patients/active', async (req, res) => {
 
 app.get('/api/stats/today', async (req, res) => {
   try {
-    const total = await pool.query(
-      `SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`
-    );
-    const waiting = await pool.query(
-      `SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting'`
-    );
-    const seen = await pool.query(
-      `SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`
-    );
-    const appointments = await pool.query(
-      `SELECT COUNT(*) FROM appointments WHERE DATE(created_at) = CURRENT_DATE`
-    );
+    const total = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`);
+    const waiting = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting'`);
+    const seen = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`);
+    const appointments = await pool.query(`SELECT COUNT(*) FROM appointments WHERE DATE(created_at) = CURRENT_DATE`);
     const avgWait = await pool.query(
       `SELECT ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))/60)) as avg_minutes
-       FROM patients 
-       WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`
+       FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`
     );
     res.json({
       total: parseInt(total.rows[0].count),
@@ -781,9 +765,7 @@ app.post('/api/queue/next', async (req, res) => {
 
 app.get('/api/appointments', async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM appointments ORDER BY created_at DESC`
-    );
+    const result = await pool.query(`SELECT * FROM appointments ORDER BY created_at DESC`);
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
