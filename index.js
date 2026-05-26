@@ -263,10 +263,11 @@ CRITICAL RULES:
 6. Ask for maximum 2 pieces of missing info at a time
 7. Keep responses SHORT and friendly — this is WhatsApp not email
 8. When you have name + age + gender + complaint + symptoms + mode → IMMEDIATELY set is_complete to TRUE in your JSON response. Do not say "I've taken note" and wait. Complete registration right away.
-9. For appointments you MUST collect appointment_date AND appointment_time before setting is_complete to TRUE. After getting symptoms for an appointment patient — ask: "What date would you like to come in?" then "What time works best for you?" NEVER confirm an appointment without both date and time.
+9. For appointments — after getting symptoms ask clearly: "What date and time would you like to come in?" to collect both at once. If patient gives only time, ask for date. If patient gives only date, ask for time. NEVER confirm appointment without both.
 10. Always present the 3 visit mode options clearly when asking about visit type.
 11. If mode was already established earlier (patient selected 1, 2, or 3 from the menu) — the moment you have name + age + gender + complaint + symptoms, set is_complete to TRUE immediately. Never leave the patient waiting.
 12. Never end a response with a statement like "I've taken note" or "I have your details" without either asking the next question or completing registration.
+13. If patient says something rude, frustrated or off-topic — respond with calm empathy and redirect gently. Never crash or give up. Example: "I understand this can be a bit much. Let me help you quickly — [ask next question]"
 
 INTENT DETECTION — ONLY set these for EXACT phrases:
 - "doctor_done": ONLY if message is exactly "done", "next", "next patient", "mark done", "mark complete"
@@ -549,7 +550,7 @@ async function processMessage(phone, message) {
         return reply;
       }
       if (!data.appointment_time) {
-        const reply = `Great! And what time works best for you, ${data.name}?\n\n_(e.g. "9am", "2:30pm", "afternoon")_`;
+        const reply = `And what time works best for you, ${data.name}?\n\n_(e.g. "9am", "2:30pm", "afternoon")_`;
         history.push({ role: 'assistant', content: reply });
         data.history = history.slice(-20);
         await updateConversation(phone, 'ACTIVE', data);
@@ -630,7 +631,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     console.error('Error:', error.message);
     res.set('Content-Type', 'text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
-      <Response><Message>Sorry, something went wrong. Please try again or speak to reception.</Message></Response>`);
+      <Response><Message>I'm sorry I couldn't understand that. 😊 Please try again or speak to reception for help.\n\n_— Zero_</Message></Response>`);
   }
 });
 
