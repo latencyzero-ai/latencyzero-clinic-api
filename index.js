@@ -512,9 +512,49 @@ async function processMessage(phone, message) {
 
   // ── HANDLE COMPLETE INTAKE ──
   if (aiResponse.is_complete) {
+
+    // ── GLOBAL SAFETY CHECKS ──
+    if (!data.name || !data.age || !data.gender) {
+      const reply = `I still need a few details. Could you share your full name, age and gender?`;
+      history.push({ role: 'assistant', content: reply });
+      data.history = history.slice(-20);
+      await updateConversation(phone, 'ACTIVE', data);
+      return reply;
+    }
+
+    if (!data.complaint || !data.symptoms) {
+      const reply = `Could you tell me more about what brought you in today, ${data.name}? What are you experiencing?`;
+      history.push({ role: 'assistant', content: reply });
+      data.history = history.slice(-20);
+      await updateConversation(phone, 'ACTIVE', data);
+      return reply;
+    }
+
+    if (!data.mode) {
+      const reply = `How do you plan to visit us today, ${data.name}?\n\n1️⃣ I'm already at the clinic\n2️⃣ I'm on my way\n3️⃣ I'd like to book an appointment`;
+      history.push({ role: 'assistant', content: reply });
+      data.history = history.slice(-20);
+      await updateConversation(phone, 'ACTIVE', data);
+      return reply;
+    }
+
     const routing = await getAIRouting(data.complaint, data.symptoms || '');
 
     if (data.mode === 'appointment') {
+      if (!data.appointment_date) {
+        const reply = `Almost there, ${data.name}! 😊\n\nWhat date would you like to come in?\n\n_(e.g. "Tomorrow", "Monday", "27th May")_`;
+        history.push({ role: 'assistant', content: reply });
+        data.history = history.slice(-20);
+        await updateConversation(phone, 'ACTIVE', data);
+        return reply;
+      }
+      if (!data.appointment_time) {
+        const reply = `Great! And what time works best for you, ${data.name}?\n\n_(e.g. "9am", "2:30pm", "afternoon")_`;
+        history.push({ role: 'assistant', content: reply });
+        data.history = history.slice(-20);
+        await updateConversation(phone, 'ACTIVE', data);
+        return reply;
+      }
       await saveAppointment(data, routing);
       await notifyClinic('appointment', {
         name: data.name, age: data.age, gender: data.gender,
