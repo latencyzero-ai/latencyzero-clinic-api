@@ -268,6 +268,7 @@ CRITICAL RULES:
 11. If mode was already established earlier (patient selected 1, 2, or 3 from the menu) — the moment you have name + age + gender + complaint + symptoms, set is_complete to TRUE immediately. Never leave the patient waiting.
 12. Never end a response with a statement like "I've taken note" or "I have your details" without either asking the next question or completing registration.
 13. If patient says something rude, frustrated or off-topic — respond with calm empathy and redirect gently. Never crash or give up. Example: "I understand this can be a bit much. Let me help you quickly — [ask next question]"
+14. If mode is already set in ALREADY COLLECTED data — NEVER ask how they plan to visit again. Skip straight to collecting any remaining missing information.
 
 INTENT DETECTION — ONLY set these for EXACT phrases:
 - "doctor_done": ONLY if message is exactly "done", "next", "next patient", "mark done", "mark complete"
@@ -440,6 +441,17 @@ async function processMessage(phone, message) {
 
   // ── ADD MESSAGE TO HISTORY ──
   history.push({ role: 'user', content: message });
+
+  // ── DETECT MENU SELECTION ──
+if (conv.state === 'ACTIVE' && !data.mode) {
+  if (msg === '1' || msg === 'walk-in' || msg === 'walk in') {
+    data.mode = 'walkin';
+  } else if (msg === '2' || msg === 'appointment' || msg === 'book') {
+    data.mode = 'appointment';
+  } else if (msg === '3' || msg === 'on my way' || msg === 'onmyway') {
+    data.mode = 'onmyway';
+  }
+}
 
   // ── CALL ZERO AI ──
   const aiResponse = await zeroAI(message, history.slice(-20), data, config);
