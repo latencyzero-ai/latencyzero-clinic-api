@@ -1,18 +1,39 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
 const axios = require('axios');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ─── HTTP + SOCKET.IO SERVER ──────────────────────────
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] }
+});
+
+io.on('connection', (socket) => {
+  console.log('Dashboard connected:', socket.id);
+  socket.on('disconnect', () => console.log('Dashboard disconnected:', socket.id));
+});
+
+// ─── DATABASE ─────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+// ─── META WHATSAPP CONFIG ─────────────────────────────
+const META_API = 'https://graph.facebook.com/v21.0';
+const PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
+const ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
+const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
+const DASHBOARD_URL = process.env.DASHBOARD_URL || 'https://zero-dashboard-nine.vercel.app';
 
 // ─── TIME GREETING ─────────────────────────────────────
 function getGreeting() {
@@ -78,25 +99,30 @@ async function getNextQueueNumber() {
   return next;
 }
 
-// ─── SEND WHATSAPP ────────────────────────────────────
+// ─── SEND WHATSAPP VIA META ───────────────────────────
 async function sendWhatsApp(to, message) {
   try {
+    // Clean phone number — remove + if present
+    const cleanPhone = to.replace(/[^0-9]/g, '');
+    
     await axios.post(
-      `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`,
-      new URLSearchParams({
-        From: `whatsapp:${process.env.TWILIO_WHATSAPP_NUMBER}`,
-        To: `whatsapp:${to}`,
-        Body: message
-      }),
+      `${META_API}/${PHONE_NUMBER_ID}/messages`,
       {
-        auth: {
-          username: process.env.TWILIO_ACCOUNT_SID,
-          password: process.env.TWILIO_AUTH_TOKEN
+        messaging_product: 'whatsapp',
+        to: cleanPhone,
+        type: 'text',
+        text: { body: message }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
         }
       }
     );
+    console.log('WhatsApp sent to:', cleanPhone);
   } catch (e) {
-    console.log('WhatsApp send error:', e.message);
+    console.log('WhatsApp send error:', e.response?.data || e.message);
   }
 }
 
@@ -104,7 +130,6 @@ async function sendWhatsApp(to, message) {
 async function notifyClinic(type, data, config) {
   const urgencyEmoji = { 'High': '🔴', 'Medium': '🟡', 'Low': '🟢' };
   let clinicMsg = '';
-  let doctorMsg = '';
 
   if (type === 'walkin') {
     clinicMsg =
@@ -117,8 +142,8 @@ async function notifyClinic(type, data, config) {
       `${urgencyEmoji[data.urgency] || '🟢'} Urgency: *${data.urgency}*\n\n` +
       `💬 Complaint: ${data.complaint}\n` +
       `🩺 Symptoms: ${data.symptoms}\n` +
-      `📋 Summary: ${data.summary}`;
-    doctorMsg = clinicMsg;
+      `📋 Summary: ${data.summary}\n\n` +
+      `📊 View Dashboard: ${DASHBOARD_URL}`;
   }
 
   if (type === 'onmyway') {
@@ -131,8 +156,8 @@ async function notifyClinic(type, data, config) {
       `${urgencyEmoji[data.urgency] || '🟢'} Urgency: *${data.urgency}*\n\n` +
       `💬 Complaint: ${data.complaint}\n` +
       `📋 Summary: ${data.summary}\n\n` +
-      `_Queue number will be assigned on arrival._`;
-    doctorMsg = clinicMsg;
+      `_Queue number will be assigned on arrival._\n\n` +
+      `📊 View Dashboard: ${DASHBOARD_URL}`;
   }
 
   if (type === 'appointment') {
@@ -144,8 +169,8 @@ async function notifyClinic(type, data, config) {
       `🏥 Department: *${data.department}*\n` +
       `📆 Date: *${data.appointment_date}*\n` +
       `🕐 Time: *${data.appointment_time}*\n\n` +
-      `💬 Complaint: ${data.complaint}`;
-    doctorMsg = clinicMsg;
+      `💬 Complaint: ${data.complaint}\n\n` +
+      `📊 View Dashboard: ${DASHBOARD_URL}`;
   }
 
   if (type === 'next') {
@@ -155,22 +180,17 @@ async function notifyClinic(type, data, config) {
       `👤 Name: *${data.name}*\n` +
       `🏥 Department: *${data.department}*\n` +
       `💬 Complaint: ${data.complaint}\n\n` +
-      `_Please call the patient in now._`;
-    doctorMsg =
-      `👨‍⚕️ *Next Patient*\n\n` +
-      `🔢 Queue: *#${data.queueNumber}*\n` +
-      `👤 ${data.name}\n` +
-      `🏥 ${data.department}\n` +
-      `💬 ${data.complaint}\n\n` +
-      `_Patient has been notified to come in._`;
+      `_Please call the patient in now._\n\n` +
+      `📊 View Dashboard: ${DASHBOARD_URL}`;
   }
 
+  // Only notify receptionist — all management happens on dashboard
   if (config.receptionist_whatsapp) {
     await sendWhatsApp(config.receptionist_whatsapp, clinicMsg);
   }
-  if (config.doctor_whatsapp && doctorMsg) {
-    await sendWhatsApp(config.doctor_whatsapp, doctorMsg);
-  }
+
+  // Emit to dashboard via Socket.io
+  io.emit('queue_updated', { type, data });
 }
 
 // ─── APPOINTMENT REMINDER ─────────────────────────────
@@ -204,8 +224,6 @@ async function checkAndSendReminders() {
         `UPDATE appointments SET status = 'reminder_sent' WHERE id = $1`,
         [appt.id]
       );
-
-      console.log(`Reminder sent to ${appt.name} — ${appt.phone}`);
     }
   } catch (e) {
     console.log('Reminder error:', e.message);
@@ -252,6 +270,7 @@ RULES:
 6. Keep messages SHORT — this is WhatsApp
 7. If patient seems frustrated or confused — be calm, apologize briefly and ask the next question simply
 8. When ALL required fields are collected — set is_complete to TRUE immediately
+9. If patient only gives name without age/gender — ask for age and gender before moving to medical questions
 
 INTENT DETECTION:
 - "doctor_done": message is exactly "done", "next", "next patient", "mark done", "mark complete"
@@ -343,21 +362,13 @@ async function savePatient(data, queueNumber, routing) {
 
 // ─── SAVE APPOINTMENT ─────────────────────────────────
 async function saveAppointment(data, routing) {
-  // Store date and time as plain text — no parsing
   const result = await pool.query(
     `INSERT INTO appointments 
      (phone, name, age, gender, complaint, department, appointment_date, appointment_time, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'scheduled') RETURNING *`,
-    [
-      data.phone,
-      data.name,
-      data.age,
-      data.gender,
-      data.complaint,
-      routing.department,
-      data.appointment_date,
-      data.appointment_time
-    ]
+    [data.phone, data.name, data.age, data.gender,
+     data.complaint, routing.department,
+     data.appointment_date, data.appointment_time]
   );
   return result.rows[0];
 }
@@ -386,6 +397,30 @@ function detectMenuSelection(msg) {
   return null;
 }
 
+// ─── SAVE MESSAGE TO CONVERSATIONS TABLE ──────────────
+async function saveMessage(phone, role, content) {
+  try {
+    await pool.query(
+      `INSERT INTO conversations (phone, state, data, updated_at)
+       VALUES ($1, 'ACTIVE', $2, NOW())
+       ON CONFLICT (phone) DO UPDATE 
+       SET data = jsonb_set(
+         COALESCE(conversations.data, '{}'),
+         '{messages}',
+         COALESCE(conversations.data->'messages', '[]'::jsonb) || $3::jsonb
+       ),
+       updated_at = NOW()`,
+      [
+        phone,
+        JSON.stringify({ messages: [{ role, content, timestamp: new Date().toISOString() }] }),
+        JSON.stringify({ role, content, timestamp: new Date().toISOString() })
+      ]
+    );
+  } catch (e) {
+    console.log('Save message error:', e.message);
+  }
+}
+
 // ─── PROCESS MESSAGE ──────────────────────────────────
 async function processMessage(phone, message) {
   const conv = await getConversation(phone);
@@ -405,7 +440,7 @@ async function processMessage(phone, message) {
     return welcomeMsg;
   }
 
-  // ── FIRST TIME / SHOW WELCOME ──
+  // ── FIRST TIME ──
   if (conv.state === 'START') {
     const welcomeMsg = buildWelcome(config, greeting, false);
     history = [{ role: 'assistant', content: welcomeMsg }];
@@ -414,7 +449,7 @@ async function processMessage(phone, message) {
     return welcomeMsg;
   }
 
-  // ── MENU STATE — waiting for selection ──
+  // ── MENU STATE ──
   if (conv.state === 'MENU') {
     const selection = detectMenuSelection(msg);
 
@@ -426,7 +461,7 @@ async function processMessage(phone, message) {
         const p = patient.rows[0];
         return `Your queue status:\n\n🔢 Queue Number: *#${p.queue_number}*\n🏥 Department: *${p.department}*\n⏳ Status: *Waiting*\n\nPlease remain seated. I'll notify you when it's your turn! 😊`;
       }
-      return `You don't have an active queue number yet.\n\nWould you like to register? Reply *1* for walk-in or *2* to book an appointment.`;
+      return `You don't have an active queue number yet.\n\nReply *1* for walk-in or *2* to book an appointment.`;
     }
 
     if (selection) {
@@ -444,50 +479,40 @@ async function processMessage(phone, message) {
       return modeReply;
     }
 
-    // No valid selection — show menu again
     return buildWelcome(config, greeting, false);
   }
 
   // ── ACTIVE — collecting patient info ──
   history.push({ role: 'user', content: message });
 
-  // Check for special intents first
-  if (msg === 'done' || msg === 'next' || msg === 'next patient' || msg === 'mark done' || msg === 'mark complete') {
+  // Check exact intents
+  if (['done', 'next', 'next patient', 'mark done', 'mark complete'].includes(msg)) {
     const current = await pool.query(
       `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
     );
     if (current.rows.length > 0) {
-      await pool.query(
-        `UPDATE patients SET status = 'seen' WHERE id = $1`, [current.rows[0].id]
-      );
+      await pool.query('UPDATE patients SET status = $1 WHERE id = $2', ['seen', current.rows[0].id]);
       const next = await pool.query(
         `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
       );
       if (next.rows.length > 0) {
         const n = next.rows[0];
-        await sendWhatsApp(n.phone,
-          `🔔 *Hi ${n.name}!* It's your turn!\n\nPlease proceed to the consultation room. The doctor is ready for you. 🏥\n\n_— Zero_`
-        );
-        await notifyClinic('next', {
-          queueNumber: n.queue_number,
-          name: n.name,
-          department: n.department,
-          complaint: n.complaint
-        }, config);
-        return `✅ Patient #${current.rows[0].queue_number} marked as seen.\n\n*Next patient called:*\n👤 ${n.name} — #${n.queue_number}\n🏥 ${n.department}`;
+        await sendWhatsApp(n.phone, `🔔 *Hi ${n.name}!* It's your turn!\n\nPlease proceed to the consultation room. The doctor is ready for you. 🏥\n\n_— Zero_`);
+        await notifyClinic('next', { queueNumber: n.queue_number, name: n.name, department: n.department, complaint: n.complaint }, config);
+        io.emit('queue_updated', { type: 'next' });
+        return `✅ Patient #${current.rows[0].queue_number} marked as seen.\n\n*Next:* ${n.name} — #${n.queue_number}`;
       }
-      return `✅ Patient marked as seen.\n\nNo more patients in the queue. 🎉`;
+      io.emit('queue_updated', { type: 'done' });
+      return `✅ Patient marked as seen.\n\nNo more patients in queue. 🎉`;
     }
     return `No active patients in the queue.`;
   }
 
-  if (msg === 'queue' || msg === 'check queue' || msg === 'my number' || msg === 'queue status') {
-    const patient = await pool.query(
-      'SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']
-    );
+  if (['queue', 'check queue', 'my number', 'queue status'].includes(msg)) {
+    const patient = await pool.query('SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']);
     if (patient.rows.length > 0) {
       const p = patient.rows[0];
-      return `Your queue status:\n\n🔢 Queue Number: *#${p.queue_number}*\n🏥 Department: *${p.department}*\n⏳ Status: *Waiting*\n\nPlease remain seated! 😊`;
+      return `Your queue status:\n\n🔢 *#${p.queue_number}*\n🏥 ${p.department}\n⏳ Waiting\n\nI'll notify you when it's your turn! 😊`;
     }
     return `You don't have an active queue number yet.`;
   }
@@ -511,15 +536,14 @@ async function processMessage(phone, message) {
       [phone]
     );
     await updateConversation(phone, 'START', {});
-    return `Your appointment has been cancelled${data.name ? ', ' + data.name : ''}. 😊\n\nWe hope to see you another time. Message us anytime to rebook.\n\n_— Zero_`;
+    return `Your appointment has been cancelled${data.name ? ', ' + data.name : ''}. 😊\n\nMessage us anytime to rebook.\n\n_— Zero_`;
   }
 
   // ── HANDLE COMPLETE INTAKE ──
   if (aiResponse.is_complete) {
 
-    // Safety checks
     if (!data.name || !data.age || !data.gender) {
-      const reply = `I still need a few details. Could you share your full name, age and gender?`;
+      const reply = `Could you share your full name, age and gender?`;
       history.push({ role: 'assistant', content: reply });
       data.history = history.slice(-20);
       await updateConversation(phone, 'ACTIVE', data);
@@ -535,7 +559,7 @@ async function processMessage(phone, message) {
     }
 
     if (!data.symptoms) {
-      const reply = `Can you describe your symptoms in a bit more detail, ${data.name}?`;
+      const reply = `Can you describe your symptoms in more detail, ${data.name}?`;
       history.push({ role: 'assistant', content: reply });
       data.history = history.slice(-20);
       await updateConversation(phone, 'ACTIVE', data);
@@ -562,18 +586,12 @@ async function processMessage(phone, message) {
       await saveAppointment(data, routing);
       await notifyClinic('appointment', {
         name: data.name, age: data.age, gender: data.gender,
-        phone: phone, complaint: data.complaint,
-        department: routing.department,
-        appointment_date: data.appointment_date,
-        appointment_time: data.appointment_time
+        phone, complaint: data.complaint, department: routing.department,
+        appointment_date: data.appointment_date, appointment_time: data.appointment_time
       }, config);
+      io.emit('queue_updated', { type: 'appointment' });
       await updateConversation(phone, 'DONE', { phone, history: [] });
-      return `✅ *Appointment Confirmed, ${data.name}!*\n\n` +
-        `📅 Date: *${data.appointment_date}*\n` +
-        `🕐 Time: *${data.appointment_time}*\n` +
-        `🏥 Department: *${routing.department}*\n\n` +
-        `The clinic has been notified. Please arrive 10 minutes early.\n\n` +
-        `_See you soon! — Zero_ 🤖`;
+      return `✅ *Appointment Confirmed, ${data.name}!*\n\n📅 Date: *${data.appointment_date}*\n🕐 Time: *${data.appointment_time}*\n🏥 Department: *${routing.department}*\n\nPlease arrive 10 minutes early.\n\n_See you soon! — Zero_ 🤖`;
     }
 
     const routing = await getAIRouting(data.complaint, data.symptoms || '');
@@ -581,12 +599,10 @@ async function processMessage(phone, message) {
     if (data.mode === 'onmyway') {
       await notifyClinic('onmyway', {
         name: data.name, age: data.age, gender: data.gender,
-        phone: phone, complaint: data.complaint,
-        symptoms: data.symptoms || '',
-        department: routing.department,
-        urgency: routing.urgency,
-        summary: routing.summary
+        phone, complaint: data.complaint, symptoms: data.symptoms || '',
+        department: routing.department, urgency: routing.urgency, summary: routing.summary
       }, config);
+      io.emit('queue_updated', { type: 'onmyway' });
       await updateConversation(phone, 'DONE', { phone, history: [] });
       return `✅ *Got it, ${data.name}!*\n\nThe clinic has been notified you're on your way! 🚗\n\n🏥 Likely Department: *${routing.department}*\n\nA queue number will be assigned when you arrive.\n\n_See you soon! — Zero_ 🤖`;
     }
@@ -595,22 +611,14 @@ async function processMessage(phone, message) {
     const queueNumber = await getNextQueueNumber();
     await savePatient(data, queueNumber, routing);
     await notifyClinic('walkin', {
-      queueNumber,
-      name: data.name, age: data.age, gender: data.gender,
-      phone: phone, complaint: data.complaint,
-      symptoms: data.symptoms || '',
-      department: routing.department,
-      urgency: routing.urgency,
-      summary: routing.summary
+      queueNumber, name: data.name, age: data.age, gender: data.gender,
+      phone, complaint: data.complaint, symptoms: data.symptoms || '',
+      department: routing.department, urgency: routing.urgency, summary: routing.summary
     }, config);
+    io.emit('queue_updated', { type: 'walkin', queueNumber });
     await updateConversation(phone, 'DONE', { phone, history: [] });
 
-    return `✅ *You're all set, ${data.name}!*\n\n` +
-      `🔢 Queue Number: *#${queueNumber}*\n` +
-      `🏥 Department: *${routing.department}*\n` +
-      `${routing.urgency === 'High' ? '🔴' : routing.urgency === 'Medium' ? '🟡' : '🟢'} Urgency: *${routing.urgency}*\n\n` +
-      `Please take a seat at reception. I'll message you when it's your turn.\n\n` +
-      `_Thank you for your patience! — Zero_ 🤖`;
+    return `✅ *You're all set, ${data.name}!*\n\n🔢 Queue Number: *#${queueNumber}*\n🏥 Department: *${routing.department}*\n${routing.urgency === 'High' ? '🔴' : routing.urgency === 'Medium' ? '🟡' : '🟢'} Urgency: *${routing.urgency}*\n\nPlease take a seat at reception. I'll message you when it's your turn.\n\n_Thank you for your patience! — Zero_ 🤖`;
   }
 
   // ── CONTINUE CONVERSATION ──
@@ -620,8 +628,78 @@ async function processMessage(phone, message) {
   return aiResponse.reply;
 }
 
-// ─── TWILIO WEBHOOK ───────────────────────────────────
+// ─── META WEBHOOK VERIFICATION ────────────────────────
+app.get('/webhook/whatsapp', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('Webhook verified!');
+    return res.status(200).send(challenge);
+  }
+  res.sendStatus(403);
+});
+
+// ─── META WEBHOOK — INCOMING MESSAGES ─────────────────
 app.post('/webhook/whatsapp', async (req, res) => {
+  // Always respond 200 immediately — Meta requires this
+  res.sendStatus(200);
+
+  try {
+    const body = req.body;
+
+    if (!body.object || body.object !== 'whatsapp_business_account') return;
+
+    const entry = body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+
+    if (!value?.messages?.[0]) return;
+
+    const msg = value.messages[0];
+    const phone = msg.from;
+    const message = msg.text?.body;
+
+    if (!phone || !message) return;
+
+    console.log(`Message from ${phone}: ${message}`);
+
+    // Emit to dashboard
+    io.emit('new_message', {
+      conversationId: phone,
+      message: {
+        id: msg.id,
+        role: 'patient',
+        content: message,
+        timestamp: new Date().toISOString()
+      }
+    });
+
+    // Process and reply
+    const reply = await processMessage(phone, message);
+
+    // Send reply via Meta API
+    await sendWhatsApp(phone, reply);
+
+    // Emit reply to dashboard
+    io.emit('new_message', {
+      conversationId: phone,
+      message: {
+        id: `zero_${Date.now()}`,
+        role: 'assistant',
+        content: reply,
+        timestamp: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Webhook error:', error.message);
+  }
+});
+
+// ─── TWILIO WEBHOOK (KEEP FOR SANDBOX TESTING) ───────
+app.post('/webhook/twilio', async (req, res) => {
   const phone = req.body.From?.replace('whatsapp:', '');
   const message = req.body.Body;
 
@@ -636,7 +714,99 @@ app.post('/webhook/whatsapp', async (req, res) => {
     console.error('Error:', error.message);
     res.set('Content-Type', 'text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?>
-      <Response><Message>Sorry, something went wrong. Please try again or speak to reception. 😊\n\n_— Zero_</Message></Response>`);
+      <Response><Message>Sorry, something went wrong. Please try again. 😊\n\n_— Zero_</Message></Response>`);
+  }
+});
+
+// ─── CONVERSATION ENDPOINTS (FOR ZEROCHAT) ────────────
+app.get('/api/conversations', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT phone as id, phone, state, data, 
+       COALESCE(data->>'name', 'Unknown') as patient_name,
+       CASE WHEN data->>'flagged' = 'true' THEN true ELSE false END as flagged,
+       data->>'flag_reason' as flag_reason,
+       updated_at
+       FROM conversations 
+       WHERE state != 'START'
+       ORDER BY updated_at DESC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/conversations/:id/messages', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const conv = await pool.query('SELECT * FROM conversations WHERE phone = $1', [id]);
+    if (conv.rows.length === 0) return res.json([]);
+    
+    const data = conv.rows[0].data || {};
+    const history = data.history || [];
+    
+    const messages = history.map((h, i) => ({
+      id: `msg_${i}`,
+      role: h.role === 'assistant' ? 'assistant' : 'patient',
+      content: h.content,
+      timestamp: new Date().toISOString()
+    }));
+
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/conversations/:id/reply', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { body } = req.body;
+    
+    // Send message via WhatsApp
+    await sendWhatsApp(id, body);
+    
+    const message = {
+      id: `staff_${Date.now()}`,
+      role: 'assistant',
+      content: body,
+      timestamp: new Date().toISOString()
+    };
+
+    io.emit('new_message', { conversationId: id, message });
+    res.json(message);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/conversations/:id/resolve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(
+      `UPDATE conversations SET data = jsonb_set(COALESCE(data, '{}'), '{flagged}', 'false'), updated_at = NOW() WHERE phone = $1`,
+      [id]
+    );
+    io.emit('conversation_updated', { conversation: { id, flagged: false } });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/conversations/:id/ai-pause', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { paused } = req.body;
+    await pool.query(
+      `UPDATE conversations SET data = jsonb_set(COALESCE(data, '{}'), '{ai_paused}', $1::jsonb), updated_at = NOW() WHERE phone = $2`,
+      [JSON.stringify(paused), id]
+    );
+    io.emit('ai_paused', { conversationId: id, paused });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -644,10 +814,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 app.get('/api/patients/active', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM patients 
-       WHERE DATE(created_at) = CURRENT_DATE 
-       AND status = 'waiting'
-       ORDER BY queue_number ASC`
+      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting' ORDER BY queue_number ASC`
     );
     res.json(result.rows);
   } catch (error) {
@@ -660,15 +827,17 @@ app.get('/api/stats/today', async (req, res) => {
     const total = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`);
     const waiting = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting'`);
     const seen = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`);
+    const withDoctor = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'with_doctor'`);
     const appointments = await pool.query(`SELECT COUNT(*) FROM appointments WHERE DATE(created_at) = CURRENT_DATE`);
     const avgWait = await pool.query(
       `SELECT ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))/60)) as avg_minutes
        FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`
     );
     res.json({
-      total: parseInt(total.rows[0].count),
+      total_today: parseInt(total.rows[0].count),
       waiting: parseInt(waiting.rows[0].count),
-      seen: parseInt(seen.rows[0].count),
+      with_doctor: parseInt(withDoctor.rows[0].count),
+      completed: parseInt(seen.rows[0].count),
       appointments: parseInt(appointments.rows[0].count),
       avg_wait_minutes: parseInt(avgWait.rows[0].avg_minutes) || 0
     });
@@ -702,18 +871,18 @@ app.get('/api/queue', async (req, res) => {
 app.patch('/api/patients/:id/status', async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
-  const validStatuses = ['waiting', 'seen', 'done', 'cancelled'];
+  const validStatuses = ['waiting', 'seen', 'done', 'cancelled', 'with_doctor', 'WAITING', 'DONE', 'WITH_DOCTOR', 'ARRIVED', 'MISSED', 'CANCELLED'];
   if (!validStatuses.includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
   }
   try {
     const result = await pool.query(
       `UPDATE patients SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
-      [status, id]
+      [status.toLowerCase(), id]
     );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Patient not found' });
-    }
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Patient not found' });
+    
+    io.emit('queue_updated', { type: 'status_change', patient: result.rows[0] });
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -727,36 +896,26 @@ app.post('/api/queue/next', async (req, res) => {
       `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
     );
     if (current.rows.length === 0) {
-      return res.json({ message: 'No patients in queue', next: null });
+      return res.json({ success: false, message: 'No patients in queue', next: null });
     }
+
+    // Mark current as with_doctor
     await pool.query(
-      `UPDATE patients SET status = 'seen', updated_at = NOW() WHERE id = $1`,
+      `UPDATE patients SET status = 'with_doctor', updated_at = NOW() WHERE id = $1`,
       [current.rows[0].id]
     );
-    const next = await pool.query(
-      `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
+
+    // Notify patient
+    await sendWhatsApp(current.rows[0].phone,
+      `🔔 *Hi ${current.rows[0].name}!* It's your turn!\n\nPlease proceed to the consultation room. The doctor is ready for you. 🏥\n\n_— Zero_`
     );
-    if (next.rows.length > 0) {
-      const n = next.rows[0];
-      await sendWhatsApp(n.phone,
-        `🔔 *Hi ${n.name}!* It's your turn!\n\nPlease proceed to the consultation room. The doctor is ready for you. 🏥\n\n_— Zero_`
-      );
-      await notifyClinic('next', {
-        queueNumber: n.queue_number,
-        name: n.name,
-        department: n.department,
-        complaint: n.complaint
-      }, config);
-      return res.json({
-        message: 'Queue advanced',
-        previous: current.rows[0],
-        next: next.rows[0]
-      });
-    }
+
+    io.emit('queue_updated', { type: 'next', patient: current.rows[0] });
+
     res.json({
-      message: 'No more patients in queue',
-      previous: current.rows[0],
-      next: null
+      success: true,
+      message: 'Patient called',
+      patient: current.rows[0]
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -776,7 +935,11 @@ app.get('/', (req, res) => {
   res.json({ status: 'LatencyZero Clinic API running 🏥' });
 });
 
+// ─── START SERVER ─────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Clinic API running on port ${PORT}`);
+  console.log(`Socket.io ready`);
+  console.log(`Meta webhook: /webhook/whatsapp`);
+  console.log(`Twilio webhook: /webhook/twilio`);
 });
