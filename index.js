@@ -1373,43 +1373,21 @@ app.post('/webhook/twilio', async (req, res) => {
 // ─── ZEROCHAT CONVERSATION ENDPOINTS ──────────────────
 
 app.get('/api/conversations', async (req, res) => {
-
   try {
-
     const result = await pool.query(
-
       `SELECT phone as id, phone, state, data,
-
        COALESCE(data->>'name', 'Unknown') as patient_name,
-
        CASE WHEN data->>'flagged' = 'true' THEN true ELSE false END as flagged,
-
        data->>'flag_reason' as flag_reason,
-
-       updated_at,
-
-       jsonb_array_length(COALESCE(data->'history', '[]'::jsonb)) as message_count,
-
-       data->'history'->-1 as last_message
-
+       updated_at
        FROM conversations
-
        WHERE state != 'START'
-
        ORDER BY updated_at DESC`
-
     );
-
     res.json(result.rows);
-
   } catch (error) {
-
-    addLog('error', 'GET /api/conversations error', error.message);
-
     res.status(500).json({ error: error.message });
-
   }
-
 });
 
 app.get('/api/conversations/:id/messages', async (req, res) => {
