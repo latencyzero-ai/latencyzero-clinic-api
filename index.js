@@ -48,17 +48,31 @@ const pool = new Pool({
 
 });
 
-// ─── IDEMPOTENCY GUARD ────────────────────────────────
+// ─── IN-MEMORY ERROR LOG (last 100 entries) ───────────
 
-// FIX #1: Prevents Meta duplicate webhook events from sending double greetings
+const errorLog = [];
+
+function addLog(level, message, data = null) {
+
+  const entry = { level, message, data: data ? String(data) : null, timestamp: new Date().toISOString() };
+
+  errorLog.unshift(entry);
+
+  if (errorLog.length > 100) errorLog.pop();
+
+  if (level === 'error') console.error(`[${level.toUpperCase()}]`, message, data || '');
+
+  else console.log(`[${level.toUpperCase()}]`, message, data || '');
+
+}
+
+// ─── IDEMPOTENCY GUARD ────────────────────────────────
 
 const processedMessages = new Map();
 
 function isAlreadyProcessed(messageId) {
 
   const now = Date.now();
-
-  // Clean entries older than 60 seconds
 
   for (const [id, ts] of processedMessages) {
 
@@ -71,6 +85,26 @@ function isAlreadyProcessed(messageId) {
   processedMessages.set(messageId, now);
 
   return false;
+
+}
+
+// ─── ADMIN AUTH MIDDLEWARE ────────────────────────────
+
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'lz-admin-change-this';
+
+function adminAuth(req, res, next) {
+
+  const token = req.headers['x-admin-token'];
+
+  if (!token || token !== ADMIN_TOKEN) {
+
+    addLog('warn', 'Unauthorized admin access attempt', req.ip);
+
+    return res.status(403).json({ error: 'Unauthorized' });
+
+  }
+
+  next();
 
 }
 
@@ -122,11 +156,7 @@ async function getConfig() {
 
 async function getConversation(phone) {
 
-  const result = await pool.query(
-
-    'SELECT * FROM conversations WHERE phone = $1', [phone]
-
-  );
+  const result = await pool.query('SELECT * FROM conversations WHERE phone = $1', [phone]);
 
   if (result.rows.length === 0) {
 
@@ -174,19 +204,11 @@ async function getNextQueueNumber() {
 
   const today = new Date().toISOString().split('T')[0];
 
-  const existing = await pool.query(
-
-    'SELECT * FROM queue WHERE date = $1', [today]
-
-  );
+  const existing = await pool.query('SELECT * FROM queue WHERE date = $1', [today]);
 
   if (existing.rows.length === 0) {
 
-    await pool.query(
-
-      'INSERT INTO queue (date, last_number) VALUES ($1, 1)', [today]
-
-    );
+    await pool.query('INSERT INTO queue (date, last_number) VALUES ($1, 1)', [today]);
 
     return 1;
 
@@ -194,11 +216,7 @@ async function getNextQueueNumber() {
 
   const next = existing.rows[0].last_number + 1;
 
-  await pool.query(
-
-    'UPDATE queue SET last_number = $1 WHERE date = $2', [next, today]
-
-  );
+  await pool.query('UPDATE queue SET last_number = $1 WHERE date = $2', [next, today]);
 
   return next;
 
@@ -242,11 +260,11 @@ async function sendWhatsApp(to, message) {
 
     );
 
-    console.log('WhatsApp sent to:', cleanPhone);
+    addLog('info', `WhatsApp sent to ${cleanPhone}`);
 
   } catch (e) {
 
-    console.log('WhatsApp send error:', e.response?.data || e.message);
+    addLog('error', 'WhatsApp send error', e.response?.data || e.message);
 
   }
 
@@ -400,33 +418,21 @@ async function checkAndSendReminders() {
 
         `⏰ *Reminder from Zero!*\n\n` +
 
-        `Hi *${appt.name}*! Your appointment at *${cfg.clinic_name}* ` +
+        `Hi *${appt.name}*! Your appointment at *${cfg.clinic_name}* is in 30 minutes.\n\n` +
 
-        `is in 30 minutes.\n\n` +
-
-        `Are you:\n` +
-
-        `1️⃣ On my way / Already here\n` +
-
-        `2️⃣ Cancel appointment\n\n` +
+        `Are you:\n1️⃣ On my way / Already here\n2️⃣ Cancel appointment\n\n` +
 
         `_Please reply so we can prepare for you._`;
 
       await sendWhatsApp(appt.phone, message);
 
-      await pool.query(
-
-        `UPDATE appointments SET status = 'reminder_sent' WHERE id = $1`,
-
-        [appt.id]
-
-      );
+      await pool.query(`UPDATE appointments SET status = 'reminder_sent' WHERE id = $1`, [appt.id]);
 
     }
 
   } catch (e) {
 
-    console.log('Reminder error:', e.message);
+    addLog('error', 'Reminder error', e.message);
 
   }
 
@@ -436,13 +442,9 @@ setInterval(checkAndSendReminders, 5 * 60 * 1000);
 
 // ─── ZERO AI BRAIN ────────────────────────────────────
 
-// FIX #2: Removed duplicate user message from messages array
-
-// FIX #6: Full medical intelligence system prompt
-
 async function zeroAI(message, history, collectedData, config) {
 
-  const systemPrompt = `You are Zero, a warm and medically intelligent clinic assistant for ${config.clinic_name}.
+  const systemPrompt = `You are Zero, a warm and compassionate clinic assistant for ${config.clinic_name}.
 
 You help patients register through WhatsApp. You have deep clinical knowledge and use it to ask precise, relevant follow-up questions.
 
@@ -452,7 +454,7 @@ ${JSON.stringify(collectedData)}
 
 YOUR JOB:
 
-Look at what is already collected above. Find what is STILL MISSING. Ask for ONLY the next missing piece.
+Look at what is already collected above. Find what is STILL MISSING. Ask for ONLY the next missing piece, ONE question at a time.
 
 REQUIRED FIELDS:
 
@@ -464,7 +466,7 @@ REQUIRED FIELDS:
 
 - complaint: main reason for visit
 
-- symptoms: clinically relevant details specific to their complaint
+- symptoms: relevant details specific to their complaint
 
 - appointment_date: ONLY if mode is "appointment"
 
@@ -474,13 +476,41 @@ COLLECTION ORDER:
 
 1. name, age, gender (can be in one message)
 
-2. complaint (what brings them in)
+2. complaint
 
-3. symptoms (smart follow-up specific to the complaint — see MEDICAL INTELLIGENCE below)
+3. symptoms (smart, specific follow-up based on complaint)
 
-4. If appointment mode: date then time
+4. If appointment mode: date → time
 
-5. When all fields collected: set is_complete to true
+5. All fields collected → set is_complete to true
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+TONE & EMPATHY
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+You are warm, caring, and human. The person messaging may be unwell, anxious, or in pain.
+
+- Acknowledge what they have shared before moving to the next question
+
+- "I'm sorry to hear that" or "That sounds uncomfortable, let me help" before a question is the right instinct
+
+- Never sound like a form or an automated system
+
+- Match their energy — if they are brief, be concise. If they share a lot, be warm and attentive.
+
+NAME USAGE — READ THIS CAREFULLY:
+
+Use the patient's name ONLY TWICE in the ENTIRE conversation:
+
+  1. The FIRST time you acknowledge their name: e.g. "Thanks [Name]! What brings you in today?"
+
+  2. The FINAL confirmation message only.
+
+In ALL other messages: do NOT use the name — not "Hi [Name]", not "Okay [Name]", not at all.
+
+Using the name in every reply sounds robotic and impersonal. It must not happen.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -492,7 +522,7 @@ You understand medical conditions deeply. Use this knowledge to ask the RIGHT fo
 
 DENTAL & ORTHODONTIC (braces, alignment, gaps, spacing, crowding, missing teeth):
 
-→ You know: braces are orthodontic devices for teeth alignment — NOT related to toothache
+→ Braces are orthodontic devices for teeth alignment — NOT related to toothache
 
 → Ask: How long have you been considering this? Any pain or sensitivity currently? Upper, lower, or both?
 
@@ -504,27 +534,27 @@ CARDIAC (chest pain, palpitations, racing heart, shortness of breath):
 
 → Ask: Is it sharp, crushing, or pressure-like? Does it spread to your arm or jaw? Any sweating or dizziness?
 
-→ Chest pain with radiation = HIGH urgency — flag immediately
+→ Chest pain with radiation = HIGH urgency
 
-MUSCULOSKELETAL (back pain, joint pain, knee pain, shoulder, swelling, sports injury):
+MUSCULOSKELETAL (back pain, joint pain, knee, shoulder, sports injury):
 
-→ Ask: Which joint or area exactly? Sudden injury or gradual onset? Any swelling or bruising?
+→ Ask: Which area exactly? Sudden injury or gradual onset? Any swelling or bruising?
 
-NEUROLOGICAL (headache, migraine, dizziness, numbness, seizure, memory loss):
+NEUROLOGICAL (headache, migraine, dizziness, numbness, seizure, memory):
 
-→ Ask: Where is the headache located? How frequent? Any nausea, visual changes, or light sensitivity?
+→ Ask: Where is the pain located? How frequent? Any nausea, visual changes, or light sensitivity?
 
-RESPIRATORY (cough, asthma, breathing difficulty, wheezing, chest tightness):
+RESPIRATORY (cough, asthma, breathing difficulty, wheezing):
 
-→ Ask: Dry or productive cough? Any fever? Breathless at rest or only on exertion? How many days?
+→ Ask: Dry or productive cough? Any fever? Breathless at rest or on exertion? How many days?
 
-GASTROINTESTINAL (stomach pain, nausea, vomiting, diarrhea, constipation, bloating):
+GASTROINTESTINAL (stomach pain, nausea, vomiting, diarrhea, constipation):
 
 → Ask: Where in the abdomen? Any blood? After eating or unrelated? How many days?
 
-DERMATOLOGY (rash, itching, skin lesion, acne, eczema, wound):
+DERMATOLOGY (rash, itching, skin lesion, acne, eczema):
 
-→ Ask: Which part of the body? How long? Is it spreading? Any known allergies or triggers?
+→ Ask: Which part of the body? How long? Spreading? Known allergies or triggers?
 
 EYE / ENT (eye pain, ear pain, sore throat, nasal congestion, hearing loss):
 
@@ -550,21 +580,13 @@ CRITICAL RULES
 
 3. Accept the patient's complaint VERBATIM — do NOT rename or reinterpret it
 
-   → "I need braces" = complaint is orthodontic treatment — NOT toothache
-
-   → "I have back pain" = back pain — do NOT call it a spinal condition
-
 4. Ask ONE question at a time — this is WhatsApp, not a form
 
-5. Use the patient's name once you know it
+5. Show empathy first, then ask the next question
 
-6. Be warm but brief — no long paragraphs
+6. Set is_complete = true ONLY when every required field is filled
 
-7. If patient seems frustrated: apologize briefly and ask the next question simply
-
-8. Set is_complete = true ONLY when every required field for their mode is filled
-
-9. NOTE: "mode" is already set in collected data — NEVER ask about mode
+7. NOTE: "mode" is already set in collected data — NEVER ask about mode
 
 INTENT DETECTION:
 
@@ -608,17 +630,13 @@ RESPOND ONLY WITH THIS JSON:
 
 }
 
-Only include extracted fields you ACTUALLY found in this message. Set is_complete true only when ALL required fields are present in CURRENT PATIENT DATA after merging.`;
+Only include extracted fields you ACTUALLY found. Set is_complete true only when ALL required fields are present in CURRENT PATIENT DATA after merging.`;
 
   const messages = [
 
     { role: 'system', content: systemPrompt },
 
     ...history
-
-    // FIX: Removed duplicate { role: 'user', content: message }
-
-    // The current user message is already in history (pushed before this call)
 
   ];
 
@@ -628,7 +646,7 @@ Only include extracted fields you ACTUALLY found in this message. Set is_complet
 
     {
 
-      model: 'llama-3.3-70b-versatile', // Upgraded from llama-3.1-8b-instant for medical accuracy
+      model: 'llama-3.3-70b-versatile',
 
       messages,
 
@@ -698,6 +716,8 @@ async function getAIRouting(complaint, symptoms) {
 
   } catch (e) {
 
+    addLog('error', 'AI routing error', e.message);
+
     return { department: 'General', urgency: 'Low', summary: complaint };
 
   }
@@ -724,7 +744,7 @@ async function savePatient(data, queueNumber, routing) {
 
   );
 
-  console.log('✅ Patient saved to DB:', result.rows[0]); // Added for Railway debugging
+  addLog('info', `Patient saved: ${data.name} | Queue #${queueNumber} | ${routing.department}`);
 
   return result.rows[0];
 
@@ -749,6 +769,8 @@ async function saveAppointment(data, routing) {
      data.appointment_date, data.appointment_time]
 
   );
+
+  addLog('info', `Appointment saved: ${data.name} | ${data.appointment_date} ${data.appointment_time}`);
 
   return result.rows[0];
 
@@ -816,6 +838,8 @@ async function processMessage(phone, message) {
 
   const msg = message.trim().toLowerCase();
 
+  const now = new Date().toISOString();
+
   // ── RESTART ──
 
   if (['restart', 'reset', 'start over', 'menu'].includes(msg)) {
@@ -834,7 +858,7 @@ async function processMessage(phone, message) {
 
     const welcomeMsg = buildWelcome(config, greeting, false);
 
-    history = [{ role: 'assistant', content: welcomeMsg }];
+    history = [{ role: 'assistant', content: welcomeMsg, timestamp: now }];
 
     data.history = history;
 
@@ -874,7 +898,7 @@ async function processMessage(phone, message) {
 
       data.mode = selection;
 
-      history.push({ role: 'user', content: message });
+      history.push({ role: 'user', content: message, timestamp: now });
 
       let modeReply = '';
 
@@ -884,7 +908,7 @@ async function processMessage(phone, message) {
 
       if (selection === 'onmyway') modeReply = `Got it! Let's take your details so the clinic is ready when you arrive. 🚗\n\nCould you share your *full name, age and gender*?`;
 
-      history.push({ role: 'assistant', content: modeReply });
+      history.push({ role: 'assistant', content: modeReply, timestamp: now });
 
       data.history = history.slice(-20);
 
@@ -894,7 +918,7 @@ async function processMessage(phone, message) {
 
     }
 
-    // FIX #5: Was re-sending the full welcome. Now sends a short clarify prompt, state stays MENU.
+    // Fallthrough — patient typed something unrecognised at the menu
 
     return `I didn't quite catch that! 😊 Please choose an option:\n\n` +
 
@@ -910,15 +934,13 @@ async function processMessage(phone, message) {
 
   }
 
-  // ── DONE STATE — patient messaging again after completed flow ──
-
-  // FIX #4 (part 2): Handle returning patients cleanly instead of falling into ACTIVE with stale context
+  // ── DONE STATE — patient messaging again after a completed flow ──
 
   if (conv.state === 'DONE') {
 
     const welcomeMsg = buildWelcome(config, greeting, true);
 
-    const freshHistory = [{ role: 'assistant', content: welcomeMsg }];
+    const freshHistory = [{ role: 'assistant', content: welcomeMsg, timestamp: now }];
 
     data.history = freshHistory;
 
@@ -930,9 +952,9 @@ async function processMessage(phone, message) {
 
   // ── ACTIVE — collecting patient info ──
 
-  history.push({ role: 'user', content: message });
+  history.push({ role: 'user', content: message, timestamp: now });
 
-  // Check exact intents
+  // Doctor queue commands
 
   if (['done', 'next', 'next patient', 'mark done', 'mark complete'].includes(msg)) {
 
@@ -994,7 +1016,19 @@ async function processMessage(phone, message) {
 
   // ── CALL ZERO AI ──
 
-  const aiResponse = await zeroAI(message, history.slice(-20), data, config);
+  let aiResponse;
+
+  try {
+
+    aiResponse = await zeroAI(message, history.slice(-20), data, config);
+
+  } catch (e) {
+
+    addLog('error', 'Groq API error', e.message);
+
+    return `Sorry, I'm having a brief technical issue. 😊 Please send your message again.`;
+
+  }
 
   // ── MERGE EXTRACTED DATA ──
 
@@ -1038,7 +1072,7 @@ async function processMessage(phone, message) {
 
       const reply = `Could you share your full name, age and gender?`;
 
-      history.push({ role: 'assistant', content: reply });
+      history.push({ role: 'assistant', content: reply, timestamp: now });
 
       data.history = history.slice(-20);
 
@@ -1050,9 +1084,9 @@ async function processMessage(phone, message) {
 
     if (!data.complaint) {
 
-      const reply = `What brings you to the clinic today, ${data.name}?`;
+      const reply = `What brings you to the clinic today?`;
 
-      history.push({ role: 'assistant', content: reply });
+      history.push({ role: 'assistant', content: reply, timestamp: now });
 
       data.history = history.slice(-20);
 
@@ -1064,9 +1098,9 @@ async function processMessage(phone, message) {
 
     if (!data.symptoms) {
 
-      const reply = `Can you describe your symptoms in more detail, ${data.name}?`;
+      const reply = `Can you tell me a bit more about what you're experiencing?`;
 
-      history.push({ role: 'assistant', content: reply });
+      history.push({ role: 'assistant', content: reply, timestamp: now });
 
       data.history = history.slice(-20);
 
@@ -1080,9 +1114,9 @@ async function processMessage(phone, message) {
 
       if (!data.appointment_date) {
 
-        const reply = `What date would you like to come in, ${data.name}?\n_(e.g. "Tomorrow", "Monday", "27th May")_`;
+        const reply = `What date would you like to come in?\n_(e.g. "Tomorrow", "Monday", "27th May")_`;
 
-        history.push({ role: 'assistant', content: reply });
+        history.push({ role: 'assistant', content: reply, timestamp: now });
 
         data.history = history.slice(-20);
 
@@ -1096,7 +1130,7 @@ async function processMessage(phone, message) {
 
         const reply = `And what time works for you?\n_(e.g. "9am", "2pm", "afternoon")_`;
 
-        history.push({ role: 'assistant', content: reply });
+        history.push({ role: 'assistant', content: reply, timestamp: now });
 
         data.history = history.slice(-20);
 
@@ -1124,9 +1158,7 @@ async function processMessage(phone, message) {
 
       const confirmMsg = `✅ *Appointment Confirmed, ${data.name}!*\n\n📅 Date: *${data.appointment_date}*\n🕐 Time: *${data.appointment_time}*\n🏥 Department: *${routing.department}*\n\nPlease arrive 10 minutes early.\n\n_See you soon! — Zero_ 🤖`;
 
-      history.push({ role: 'assistant', content: confirmMsg });
-
-      // FIX #4: Keep history on completion so ZeroChat can display the conversation
+      history.push({ role: 'assistant', content: confirmMsg, timestamp: now });
 
       await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
 
@@ -1152,9 +1184,7 @@ async function processMessage(phone, message) {
 
       const onWayMsg = `✅ *Got it, ${data.name}!*\n\nThe clinic has been notified you're on your way! 🚗\n\n🏥 Likely Department: *${routing.department}*\n\nA queue number will be assigned when you arrive.\n\n_See you soon! — Zero_ 🤖`;
 
-      history.push({ role: 'assistant', content: onWayMsg });
-
-      // FIX #4: Keep history on completion so ZeroChat can display the conversation
+      history.push({ role: 'assistant', content: onWayMsg, timestamp: now });
 
       await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
 
@@ -1182,9 +1212,7 @@ async function processMessage(phone, message) {
 
     const walkinMsg = `✅ *You're all set, ${data.name}!*\n\n🔢 Queue Number: *#${queueNumber}*\n🏥 Department: *${routing.department}*\n${routing.urgency === 'High' ? '🔴' : routing.urgency === 'Medium' ? '🟡' : '🟢'} Urgency: *${routing.urgency}*\n\nPlease take a seat at reception. I'll message you when it's your turn.\n\n_Thank you for your patience! — Zero_ 🤖`;
 
-    history.push({ role: 'assistant', content: walkinMsg });
-
-    // FIX #4: Keep history on completion so ZeroChat can display the conversation
+    history.push({ role: 'assistant', content: walkinMsg, timestamp: now });
 
     await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
 
@@ -1194,7 +1222,7 @@ async function processMessage(phone, message) {
 
   // ── CONTINUE CONVERSATION ──
 
-  history.push({ role: 'assistant', content: aiResponse.reply });
+  history.push({ role: 'assistant', content: aiResponse.reply, timestamp: now });
 
   data.history = history.slice(-20);
 
@@ -1216,7 +1244,7 @@ app.get('/webhook/whatsapp', (req, res) => {
 
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
 
-    console.log('Webhook verified!');
+    addLog('info', 'Webhook verified');
 
     return res.status(200).send(challenge);
 
@@ -1229,8 +1257,6 @@ app.get('/webhook/whatsapp', (req, res) => {
 // ─── META WEBHOOK — INCOMING MESSAGES ─────────────────
 
 app.post('/webhook/whatsapp', async (req, res) => {
-
-  // Always respond 200 immediately — Meta requires this
 
   res.sendStatus(200);
 
@@ -1256,19 +1282,15 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     if (!phone || !message) return;
 
-    // FIX #1: Idempotency check — drop duplicate webhook events from Meta
-
     if (!msg.id || isAlreadyProcessed(msg.id)) {
 
-      console.log('Duplicate webhook event ignored:', msg.id);
+      addLog('info', 'Duplicate webhook ignored', msg.id);
 
       return;
 
     }
 
-    console.log(`Message from ${phone}: ${message}`);
-
-    // Emit to dashboard
+    addLog('info', `Message from ${phone}: ${message}`);
 
     io.emit('new_message', {
 
@@ -1288,15 +1310,9 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     });
 
-    // Process and reply
-
     const reply = await processMessage(phone, message);
 
-    // Send reply via Meta API
-
     await sendWhatsApp(phone, reply);
-
-    // Emit reply to dashboard
 
     io.emit('new_message', {
 
@@ -1318,13 +1334,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
   } catch (error) {
 
-    console.error('Webhook error:', error.message);
+    addLog('error', 'Webhook error', error.message);
 
   }
 
 });
 
-// ─── TWILIO WEBHOOK (KEEP FOR SANDBOX TESTING) ───────
+// ─── TWILIO WEBHOOK (SANDBOX TESTING) ────────────────
 
 app.post('/webhook/twilio', async (req, res) => {
 
@@ -1340,25 +1356,21 @@ app.post('/webhook/twilio', async (req, res) => {
 
     res.set('Content-Type', 'text/xml');
 
-    res.send(`<?xml version="1.0" encoding="UTF-8"?>
-
-      <Response><Message>${reply}</Message></Response>`);
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${reply}</Message></Response>`);
 
   } catch (error) {
 
-    console.error('Error:', error.message);
+    addLog('error', 'Twilio webhook error', error.message);
 
     res.set('Content-Type', 'text/xml');
 
-    res.send(`<?xml version="1.0" encoding="UTF-8"?>
-
-      <Response><Message>Sorry, something went wrong. Please try again. 😊\n\n_— Zero_</Message></Response>`);
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>Sorry, something went wrong. Please try again. 😊</Message></Response>`);
 
   }
 
 });
 
-// ─── CONVERSATION ENDPOINTS (FOR ZEROCHAT) ────────────
+// ─── ZEROCHAT CONVERSATION ENDPOINTS ──────────────────
 
 app.get('/api/conversations', async (req, res) => {
 
@@ -1374,7 +1386,11 @@ app.get('/api/conversations', async (req, res) => {
 
        data->>'flag_reason' as flag_reason,
 
-       updated_at
+       updated_at,
+
+       jsonb_array_length(COALESCE(data->'history', '[]'::jsonb)) as message_count,
+
+       data->'history'->-1 as last_message
 
        FROM conversations
 
@@ -1387,6 +1403,8 @@ app.get('/api/conversations', async (req, res) => {
     res.json(result.rows);
 
   } catch (error) {
+
+    addLog('error', 'GET /api/conversations error', error.message);
 
     res.status(500).json({ error: error.message });
 
@@ -1423,6 +1441,8 @@ app.get('/api/conversations/:id/messages', async (req, res) => {
     res.json(messages);
 
   } catch (error) {
+
+    addLog('error', 'GET /api/conversations/:id/messages error', error.message);
 
     res.status(500).json({ error: error.message });
 
@@ -1518,9 +1538,49 @@ app.patch('/api/conversations/:id/ai-pause', async (req, res) => {
 
 });
 
-// ─── API ENDPOINTS ────────────────────────────────────
+// ─── PATIENT & QUEUE ENDPOINTS ────────────────────────
 
 app.get('/api/patients/active', async (req, res) => {
+
+  try {
+
+    const result = await pool.query(
+
+      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting' ORDER BY queue_number ASC`
+
+    );
+
+    res.json(result.rows);
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+app.get('/api/patients', async (req, res) => {
+
+  try {
+
+    const result = await pool.query(
+
+      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE ORDER BY queue_number ASC`
+
+    );
+
+    res.json(result.rows);
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+app.get('/api/queue', async (req, res) => {
 
   try {
 
@@ -1577,46 +1637,6 @@ app.get('/api/stats/today', async (req, res) => {
       avg_wait_minutes: parseInt(avgWait.rows[0].avg_minutes) || 0
 
     });
-
-  } catch (error) {
-
-    res.status(500).json({ error: error.message });
-
-  }
-
-});
-
-app.get('/api/patients', async (req, res) => {
-
-  try {
-
-    const result = await pool.query(
-
-      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE ORDER BY queue_number ASC`
-
-    );
-
-    res.json(result.rows);
-
-  } catch (error) {
-
-    res.status(500).json({ error: error.message });
-
-  }
-
-});
-
-app.get('/api/queue', async (req, res) => {
-
-  try {
-
-    const result = await pool.query(
-
-      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting' ORDER BY queue_number ASC`
-
-    );
-
-    res.json(result.rows);
 
   } catch (error) {
 
@@ -1698,15 +1718,7 @@ app.post('/api/queue/next', async (req, res) => {
 
     io.emit('queue_updated', { type: 'next', patient: current.rows[0] });
 
-    res.json({
-
-      success: true,
-
-      message: 'Patient called',
-
-      patient: current.rows[0]
-
-    });
+    res.json({ success: true, message: 'Patient called', patient: current.rows[0] });
 
   } catch (error) {
 
@@ -1732,9 +1744,507 @@ app.get('/api/appointments', async (req, res) => {
 
 });
 
+// ─── ADMIN ENDPOINTS (LatencyZero internal) ───────────
+
+// System health check
+
+app.get('/api/admin/health', adminAuth, async (req, res) => {
+
+  const health = {
+
+    status: 'ok',
+
+    uptime_seconds: Math.floor(process.uptime()),
+
+    timestamp: new Date().toISOString(),
+
+    db: 'ok',
+
+    environment: {
+
+      has_groq_key: !!process.env.GROQ_API_KEY,
+
+      has_meta_token: !!process.env.META_ACCESS_TOKEN,
+
+      has_db_url: !!process.env.DATABASE_URL
+
+    }
+
+  };
+
+  try {
+
+    await pool.query('SELECT 1');
+
+  } catch (e) {
+
+    health.db = 'fail';
+
+    health.status = 'degraded';
+
+  }
+
+  res.json(health);
+
+});
+
+// Aggregate overview
+
+app.get('/api/admin/overview', adminAuth, async (req, res) => {
+
+  try {
+
+    const patients = await pool.query(`SELECT COUNT(*) FROM patients`);
+
+    const appointments = await pool.query(`SELECT COUNT(*) FROM appointments`);
+
+    const conversations = await pool.query(`SELECT COUNT(*) FROM conversations WHERE state != 'START'`);
+
+    const active = await pool.query(`SELECT COUNT(*) FROM conversations WHERE state = 'ACTIVE'`);
+
+    const done = await pool.query(`SELECT COUNT(*) FROM conversations WHERE state = 'DONE'`);
+
+    const today = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`);
+
+    res.json({
+
+      total_patients: parseInt(patients.rows[0].count),
+
+      total_appointments: parseInt(appointments.rows[0].count),
+
+      total_conversations: parseInt(conversations.rows[0].count),
+
+      active_conversations: parseInt(active.rows[0].count),
+
+      completed_conversations: parseInt(done.rows[0].count),
+
+      patients_today: parseInt(today.rows[0].count),
+
+      uptime_seconds: Math.floor(process.uptime()),
+
+      timestamp: new Date().toISOString()
+
+    });
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// All conversations — searchable
+
+app.get('/api/admin/conversations', adminAuth, async (req, res) => {
+
+  try {
+
+    const { state, search } = req.query;
+
+    let query = `SELECT phone as id, phone, state, data,
+
+      COALESCE(data->>'name', 'Unknown') as patient_name,
+
+      updated_at,
+
+      jsonb_array_length(COALESCE(data->'history', '[]'::jsonb)) as message_count
+
+      FROM conversations WHERE 1=1`;
+
+    const params = [];
+
+    if (state) {
+
+      params.push(state.toUpperCase());
+
+      query += ` AND state = $${params.length}`;
+
+    }
+
+    if (search) {
+
+      params.push(`%${search}%`);
+
+      query += ` AND (phone ILIKE $${params.length} OR data->>'name' ILIKE $${params.length})`;
+
+    }
+
+    query += ` ORDER BY updated_at DESC LIMIT 200`;
+
+    const result = await pool.query(query, params);
+
+    res.json(result.rows);
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// Reset a conversation to START
+
+app.patch('/api/admin/conversations/:id/reset', adminAuth, async (req, res) => {
+
+  try {
+
+    const { id } = req.params;
+
+    await pool.query(
+
+      `UPDATE conversations SET state = 'START', data = '{}', updated_at = NOW() WHERE phone = $1`,
+
+      [id]
+
+    );
+
+    addLog('info', `Admin reset conversation: ${id}`);
+
+    res.json({ success: true, message: `Conversation ${id} reset to START` });
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// Override conversation state (for debugging)
+
+app.patch('/api/admin/conversations/:id/state', adminAuth, async (req, res) => {
+
+  try {
+
+    const { id } = req.params;
+
+    const { state, data } = req.body;
+
+    await pool.query(
+
+      `UPDATE conversations SET state = $1, data = $2, updated_at = NOW() WHERE phone = $3`,
+
+      [state, JSON.stringify(data || {}), id]
+
+    );
+
+    addLog('info', `Admin override conversation ${id} → state: ${state}`);
+
+    res.json({ success: true });
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// Update clinic config remotely
+
+app.patch('/api/admin/clinic', adminAuth, async (req, res) => {
+
+  try {
+
+    const fields = req.body;
+
+    const allowedFields = ['clinic_name', 'agent_name', 'receptionist_whatsapp', 'doctor_whatsapp', 'services'];
+
+    const updates = Object.keys(fields).filter(k => allowedFields.includes(k));
+
+    if (updates.length === 0) return res.status(400).json({ error: 'No valid fields provided' });
+
+    const setClauses = updates.map((key, i) => `${key} = $${i + 1}`).join(', ');
+
+    const values = updates.map(k => key === 'services' ? fields[k] : fields[k]);
+
+    await pool.query(`UPDATE clinic_config SET ${setClauses} WHERE id = 1`, values);
+
+    addLog('info', 'Admin updated clinic config', JSON.stringify(updates));
+
+    const updated = await pool.query('SELECT * FROM clinic_config LIMIT 1');
+
+    res.json({ success: true, config: updated.rows[0] });
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// Send a WhatsApp message to any number (admin override / testing)
+
+app.post('/api/admin/message', adminAuth, async (req, res) => {
+
+  try {
+
+    const { to, message } = req.body;
+
+    if (!to || !message) return res.status(400).json({ error: 'to and message required' });
+
+    await sendWhatsApp(to, message);
+
+    addLog('info', `Admin sent message to ${to}`);
+
+    res.json({ success: true, to, message });
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// View recent error logs
+
+app.get('/api/admin/logs', adminAuth, (req, res) => {
+
+  const { level } = req.query;
+
+  const logs = level ? errorLog.filter(l => l.level === level) : errorLog;
+
+  res.json({ count: logs.length, logs });
+
+});
+
+// ─── METRICS ENDPOINTS ────────────────────────────────
+
+// Full impact report
+
+app.get('/api/metrics/impact', adminAuth, async (req, res) => {
+
+  try {
+
+    const days = parseInt(req.query.days) || 30;
+
+    const [
+
+      totalPatients,
+
+      totalAppointments,
+
+      todayPatients,
+
+      todayAppointments,
+
+      avgWait,
+
+      byDepartment,
+
+      byUrgency,
+
+      dailyTrend,
+
+      busiestHours,
+
+      convStats
+
+    ] = await Promise.all([
+
+      pool.query(`SELECT COUNT(*) FROM patients`),
+
+      pool.query(`SELECT COUNT(*) FROM appointments`),
+
+      pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`),
+
+      pool.query(`SELECT COUNT(*) FROM appointments WHERE DATE(created_at) = CURRENT_DATE`),
+
+      pool.query(`SELECT ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))/60)) as avg_minutes FROM patients WHERE status = 'seen'`),
+
+      pool.query(`SELECT department, COUNT(*) as count FROM patients GROUP BY department ORDER BY count DESC`),
+
+      pool.query(`SELECT urgency, COUNT(*) as count FROM patients WHERE urgency IS NOT NULL GROUP BY urgency ORDER BY count DESC`),
+
+      pool.query(
+
+        `SELECT DATE(created_at) as date, COUNT(*) as count
+
+         FROM patients
+
+         WHERE created_at >= NOW() - INTERVAL '${days} days'
+
+         GROUP BY DATE(created_at)
+
+         ORDER BY date ASC`
+
+      ),
+
+      pool.query(
+
+        `SELECT EXTRACT(HOUR FROM created_at)::int as hour, COUNT(*) as count
+
+         FROM patients
+
+         GROUP BY hour
+
+         ORDER BY count DESC
+
+         LIMIT 5`
+
+      ),
+
+      pool.query(
+
+        `SELECT
+
+           COUNT(*) FILTER (WHERE state != 'START') as total_started,
+
+           COUNT(*) FILTER (WHERE state = 'DONE') as completed,
+
+           ROUND(AVG(jsonb_array_length(COALESCE(data->'history', '[]'::jsonb)))) as avg_messages
+
+         FROM conversations`
+
+      )
+
+    ]);
+
+    const totalP = parseInt(totalPatients.rows[0].count);
+
+    const convRow = convStats.rows[0];
+
+    const totalStarted = parseInt(convRow.total_started) || 0;
+
+    const completed = parseInt(convRow.completed) || 0;
+
+    const completionRate = totalStarted > 0 ? Math.round((completed / totalStarted) * 1000) / 10 : 0;
+
+    const estimatedMinutesSaved = totalP * 5;
+
+    res.json({
+
+      period_days: days,
+
+      generated_at: new Date().toISOString(),
+
+      patients: {
+
+        total: totalP,
+
+        today: parseInt(todayPatients.rows[0].count),
+
+        by_department: byDepartment.rows.reduce((acc, r) => ({ ...acc, [r.department]: parseInt(r.count) }), {}),
+
+        by_urgency: byUrgency.rows.reduce((acc, r) => ({ ...acc, [r.urgency]: parseInt(r.count) }), {}),
+
+        daily_trend: dailyTrend.rows.map(r => ({ date: r.date, count: parseInt(r.count) })),
+
+        busiest_hours: busiestHours.rows.map(r => ({ hour: r.hour, count: parseInt(r.count) }))
+
+      },
+
+      appointments: {
+
+        total: parseInt(totalAppointments.rows[0].count),
+
+        today: parseInt(todayAppointments.rows[0].count)
+
+      },
+
+      efficiency: {
+
+        avg_wait_minutes: parseInt(avgWait.rows[0].avg_minutes) || 0,
+
+        avg_messages_per_conversation: parseInt(convRow.avg_messages) || 0,
+
+        estimated_minutes_saved: estimatedMinutesSaved,
+
+        estimated_hours_saved: Math.round((estimatedMinutesSaved / 60) * 10) / 10
+
+      },
+
+      zero_performance: {
+
+        total_conversations: totalStarted,
+
+        completed,
+
+        completion_rate_pct: completionRate,
+
+        avg_messages_per_conversation: parseInt(convRow.avg_messages) || 0
+
+      }
+
+    });
+
+  } catch (error) {
+
+    addLog('error', 'Metrics impact error', error.message);
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// Zero AI performance breakdown
+
+app.get('/api/metrics/zero-performance', adminAuth, async (req, res) => {
+
+  try {
+
+    const result = await pool.query(
+
+      `SELECT
+
+         COUNT(*) FILTER (WHERE state != 'START') as total_started,
+
+         COUNT(*) FILTER (WHERE state = 'DONE') as completed,
+
+         COUNT(*) FILTER (WHERE state = 'ACTIVE') as in_progress,
+
+         COUNT(*) FILTER (WHERE state = 'MENU') as at_menu,
+
+         ROUND(AVG(jsonb_array_length(COALESCE(data->'history', '[]'::jsonb)))) as avg_messages,
+
+         COUNT(*) FILTER (WHERE data->>'flagged' = 'true') as flagged
+
+       FROM conversations`
+
+    );
+
+    const row = result.rows[0];
+
+    const totalStarted = parseInt(row.total_started) || 0;
+
+    const completed = parseInt(row.completed) || 0;
+
+    res.json({
+
+      total_started: totalStarted,
+
+      completed,
+
+      in_progress: parseInt(row.in_progress),
+
+      dropped_at_menu: parseInt(row.at_menu),
+
+      completion_rate_pct: totalStarted > 0 ? Math.round((completed / totalStarted) * 1000) / 10 : 0,
+
+      avg_messages_per_conversation: parseInt(row.avg_messages) || 0,
+
+      flagged_conversations: parseInt(row.flagged)
+
+    });
+
+  } catch (error) {
+
+    res.status(500).json({ error: error.message });
+
+  }
+
+});
+
+// ─── HEALTH CHECK ─────────────────────────────────────
+
 app.get('/', (req, res) => {
 
-  res.json({ status: 'LatencyZero Clinic API running 🏥' });
+  res.json({ status: 'LatencyZero Clinic API running 🏥', version: '3.0.0' });
 
 });
 
@@ -1744,13 +2254,15 @@ const PORT = process.env.PORT || 3001;
 
 server.listen(PORT, () => {
 
-  console.log(`Clinic API running on port ${PORT}`);
+  addLog('info', `Clinic API running on port ${PORT}`);
 
-  console.log(`Socket.io ready`);
+  addLog('info', 'Socket.io ready');
 
-  console.log(`Meta webhook: /webhook/whatsapp`);
+  addLog('info', 'Meta webhook: /webhook/whatsapp');
 
-  console.log(`Twilio webhook: /webhook/twilio`);
+  addLog('info', 'Admin endpoints: /api/admin/*');
+
+  addLog('info', 'Metrics endpoints: /api/metrics/*');
 
 });
 
