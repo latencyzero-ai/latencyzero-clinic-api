@@ -809,6 +809,7 @@ app.get('/api/conversations', async (req, res) => {
        COALESCE(data->>'name', 'Unknown') as patient_name,
        CASE WHEN data->>'flagged' = 'true' THEN true ELSE false END as flagged,
        data->>'flag_reason' as flag_reason,
+       CASE WHEN data->>'ai_paused' = 'true' THEN true ELSE false END as is_ai_paused,
        updated_at
        FROM conversations
        WHERE state != 'START'
