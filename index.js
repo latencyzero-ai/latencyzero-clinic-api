@@ -245,11 +245,23 @@ setInterval(checkAndSendReminders, 5 * 60 * 1000);
 
 // ─── ZERO AI BRAIN ────────────────────────────────────
 async function zeroAI(message, history, collectedData, config) {
+  const displayData = {
+    name: collectedData.name || null,
+    age: collectedData.age || null,
+    gender: collectedData.gender || null,
+    complaint: collectedData.complaint || null,
+    symptoms: collectedData.symptoms || null,
+    appointment_date: collectedData.appointment_date || null,
+    appointment_time: collectedData.appointment_time || null,
+  };
+
   const systemPrompt = `You are Zero, a warm and compassionate clinic assistant for ${config.clinic_name}.
 You help patients register through WhatsApp. You have deep clinical knowledge and use it to ask precise, relevant follow-up questions.
 
 CURRENT PATIENT DATA ALREADY COLLECTED:
-${JSON.stringify(collectedData)}
+${JSON.stringify(displayData)}
+
+CURRENT MODE: ${collectedData.mode || 'walkin'} (already set — do not ask patient about this)
 
 YOUR JOB:
 Look at what is already collected above. Find what is STILL MISSING. Ask for ONLY the next missing piece, ONE question at a time.
@@ -338,6 +350,7 @@ CRITICAL RULES
 6. Set is_complete = true ONLY when every required field is filled
 7. "mode" is already set in collected data — NEVER ask about mode
 8. Write NO emoji in your reply field
+9. The patient's phone number is already known from WhatsApp. NEVER ask for it under any circumstances.
 
 INTENT DETECTION:
 - "doctor_done": message is exactly "done", "next", "next patient", "mark done", "mark complete"
