@@ -465,16 +465,15 @@ async function saveAppointment(data, routing) {
 // ─── BUILD WELCOME MESSAGE ────────────────────────────
 function buildWelcome(config, greeting, isReturn = false) {
   const services = config.services || ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
-  const emojis = ['🏥', '🦷', '❤️', '🧠', '🔬'];
-  const serviceList = services.map((s, i) => `${emojis[i] || '⚕️'} ${s}`).join('\n');
+  const serviceList = services.map(s => `- ${s}`).join('\n');
   return `${greeting}. I'm *${config.agent_name}*, your clinic assistant.\n\n` +
     `Welcome${isReturn ? ' back' : ''} to *${config.clinic_name}*.\n\n` +
     `Services we offer:\n${serviceList}\n\n` +
     `How can I help you today?\n\n` +
-    `1️⃣ Walk-in registration\n` +
-    `2️⃣ Book an appointment\n` +
-    `3️⃣ I'm on my way to the clinic\n` +
-    `4️⃣ Check my queue status`;
+    `1. Walk-in registration\n` +
+    `2. Book an appointment\n` +
+    `3. I'm on my way to the clinic\n` +
+    `4. Check my queue status`;
 }
 
 // ─── DETECT MENU SELECTION ────────────────────────────
@@ -525,7 +524,7 @@ async function processMessage(phone, message) {
       );
       if (patient.rows.length > 0) {
         const p = patient.rows[0];
-        return `Your queue status:\n\n🔢 Queue Number: *#${p.queue_number}*\n🏥 Department: *${p.department}*\nStatus: Waiting\n\nPlease remain seated. I'll notify you when it's your turn.`;
+        return `Your queue status:\n\nQueue Number: *#${p.queue_number}*\nDepartment: *${p.department}*\nStatus: Waiting\n\nPlease remain seated. I'll notify you when it's your turn.`;
       }
       return `You don't have an active queue number yet.\n\nReply *1* for walk-in or *2* to book an appointment.`;
     }
@@ -546,10 +545,10 @@ async function processMessage(phone, message) {
     }
 
     return `I didn't quite catch that. Please choose an option:\n\n` +
-      `1️⃣ Walk-in registration\n` +
-      `2️⃣ Book an appointment\n` +
-      `3️⃣ I'm on my way\n` +
-      `4️⃣ Check my queue number\n\n` +
+      `1. Walk-in registration\n` +
+      `2. Book an appointment\n` +
+      `3. I'm on my way\n` +
+      `4. Check my queue number\n\n` +
       `_(Reply with a number or keyword)_`;
   }
 
@@ -577,13 +576,13 @@ async function processMessage(phone, message) {
       );
       if (next.rows.length > 0) {
         const n = next.rows[0];
-        await sendWhatsApp(n.phone, `🔔 *Hi ${n.name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`);
+        await sendWhatsApp(n.phone, `*Hi ${n.name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`);
         await notifyClinic('next', { queueNumber: n.queue_number, name: n.name, department: n.department, complaint: n.complaint }, config);
         io.emit('queue_updated', { type: 'next' });
-        return `✅ Patient #${current.rows[0].queue_number} marked as seen.\n\n*Next:* ${n.name} — #${n.queue_number}`;
+        return `Patient #${current.rows[0].queue_number} marked as seen.\n\n*Next:* ${n.name} — #${n.queue_number}`;
       }
       io.emit('queue_updated', { type: 'done' });
-      return `✅ Patient marked as seen.\n\nNo more patients in queue.`;
+      return `Patient marked as seen.\n\nNo more patients in queue.`;
     }
     return `No active patients in the queue.`;
   }
@@ -592,7 +591,7 @@ async function processMessage(phone, message) {
     const patient = await pool.query('SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']);
     if (patient.rows.length > 0) {
       const p = patient.rows[0];
-      return `Your queue status:\n\n🔢 *#${p.queue_number}*\n🏥 ${p.department}\nWaiting\n\nI'll notify you when it's your turn.`;
+      return `Your queue status:\n\nQueue Number: *#${p.queue_number}*\nDepartment: ${p.department}\nStatus: Waiting\n\nI'll notify you when it's your turn.`;
     }
     return `You don't have an active queue number yet.`;
   }
@@ -677,7 +676,7 @@ async function processMessage(phone, message) {
       }, config);
       io.emit('queue_updated', { type: 'appointment' });
 
-      const confirmMsg = `✅ *Appointment confirmed, ${data.name}.*\n\n📅 Date: *${data.appointment_date}*\n🕐 Time: *${data.appointment_time}*\n🏥 Department: *${routing.department}*\n\nPlease arrive 10 minutes early.\n\n_See you soon — Zero_`;
+      const confirmMsg = `*Appointment confirmed, ${data.name}.*\n\nDate: *${data.appointment_date}*\nTime: *${data.appointment_time}*\nDepartment: *${routing.department}*\n\nPlease arrive 10 minutes early.\n\n_See you soon — Zero_`;
       history.push({ role: 'assistant', content: confirmMsg, timestamp: now });
       await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
       return confirmMsg;
@@ -693,7 +692,7 @@ async function processMessage(phone, message) {
       }, config);
       io.emit('queue_updated', { type: 'onmyway' });
 
-      const onWayMsg = `✅ *Got it, ${data.name}.*\n\nThe clinic has been notified you're on your way.\n\n🏥 Likely Department: *${routing.department}*\n\nA queue number will be assigned when you arrive.\n\n_See you soon — Zero_`;
+      const onWayMsg = `*Got it, ${data.name}.*\n\nThe clinic has been notified you're on your way.\n\nLikely Department: *${routing.department}*\n\nA queue number will be assigned when you arrive.\n\n_See you soon — Zero_`;
       history.push({ role: 'assistant', content: onWayMsg, timestamp: now });
       await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
       return onWayMsg;
@@ -709,7 +708,7 @@ async function processMessage(phone, message) {
     }, config);
     io.emit('queue_updated', { type: 'walkin', queueNumber });
 
-    const walkinMsg = `✅ *You're all set, ${data.name}.*\n\n🔢 Queue Number: *#${queueNumber}*\n🏥 Department: *${routing.department}*\n${routing.urgency === 'High' ? '🔴' : routing.urgency === 'Medium' ? '🟡' : '🟢'} Urgency: *${routing.urgency}*\n\nPlease take a seat at reception. I'll message you when it's your turn.\n\n_Thank you for your patience — Zero_`;
+    const walkinMsg = `*You're all set, ${data.name}.*\n\nQueue Number: *#${queueNumber}*\nDepartment: *${routing.department}*\nUrgency: *${routing.urgency}*\n\nPlease take a seat at reception. I'll message you when it's your turn.\n\n_Thank you for your patience — Zero_`;
     history.push({ role: 'assistant', content: walkinMsg, timestamp: now });
     await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
     return walkinMsg;
@@ -984,7 +983,7 @@ app.post('/api/queue/next', async (req, res) => {
       [current.rows[0].id]
     );
     await sendWhatsApp(current.rows[0].phone,
-      `🔔 *Hi ${current.rows[0].name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`
+      `*Hi ${current.rows[0].name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`
     );
     io.emit('queue_updated', { type: 'next', patient: current.rows[0] });
     res.json({ success: true, message: 'Patient called', patient: current.rows[0] });
