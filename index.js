@@ -501,7 +501,7 @@ async function processMessage(phone, message) {
 
   // ── RESTART ──
   if (['restart', 'reset', 'start over', 'menu'].includes(msg)) {
-    const welcomeMsg = `Your session has been restarted.\n\n` + buildWelcome(config, greeting, false);
+    const welcomeMsg = `Your session has been restarted.`;
     await updateConversation(phone, 'START', {});
     return welcomeMsg;
   }
