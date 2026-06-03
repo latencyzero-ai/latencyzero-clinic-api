@@ -396,17 +396,19 @@ Only include extracted fields you ACTUALLY found. Set is_complete true only when
     }
   });
 
-  // Strip timestamps, map 'assistant' → 'model' for Gemini
-  // Gemini requires history to start with 'user' — drop any leading model turns
-  const mapped = history.slice(0, -1).map(h => ({
+  // history already has the current user message as its last element.
+  // Map all turns to Gemini format, then drop any leading model turns
+  // (Gemini requires contents to start with a user turn).
+  const mapped = history.map(h => ({
     role: h.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: h.content }]
   }));
-  const firstUser = mapped.findIndex(m => m.role === 'user');
-  const geminiHistory = firstUser >= 0 ? mapped.slice(firstUser) : [];
+  const firstUser = mapped.findIndex(t => t.role === 'user');
+  const contents = firstUser >= 0
+    ? mapped.slice(firstUser)
+    : [{ role: 'user', parts: [{ text: message }] }];
 
-  const chat = model.startChat({ history: geminiHistory });
-  const result = await chat.sendMessage(message);
+  const result = await model.generateContent({ contents });
   return JSON.parse(result.response.text());
 }
 
