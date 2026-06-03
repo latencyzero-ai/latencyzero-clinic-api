@@ -5,6 +5,9 @@ const http = require('http');
 const { Server } = require('socket.io');
 const axios = require('axios');
 const { Pool } = require('pg');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -383,51 +386,41 @@ RESPOND ONLY WITH THIS JSON:
 
 Only include extracted fields you ACTUALLY found. Set is_complete true only when ALL required fields are present in CURRENT PATIENT DATA after merging.`;
 
-  // FIX: Strip timestamps before sending to Groq — only role + content allowed
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...history.map(h => ({ role: h.role, content: h.content }))
-  ];
-
-  const response = await axios.post(
-    'https://api.groq.com/openai/v1/chat/completions',
-    {
-      model: 'llama-3.3-70b-versatile',
-      messages,
-      max_tokens: 500,
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.0-flash',
+    systemInstruction: systemPrompt,
+    generationConfig: {
+      responseMimeType: 'application/json',
       temperature: 0.3,
-      response_format: { type: 'json_object' }
-    },
-    {
-      headers: {
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
+      maxOutputTokens: 500,
     }
-  );
+  });
 
-  return JSON.parse(response.data.choices[0].message.content);
+  // Strip timestamps, map 'assistant' → 'model' for Gemini
+  const geminiHistory = history.slice(0, -1).map(h => ({
+    role: h.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: h.content }]
+  }));
+
+  const chat = model.startChat({ history: geminiHistory });
+  const result = await chat.sendMessage(message);
+  return JSON.parse(result.response.text());
 }
 
 // ─── AI ROUTING ───────────────────────────────────────
 async function getAIRouting(complaint, symptoms) {
   try {
-    const response = await axios.post(
-      'https://api.groq.com/openai/v1/chat/completions',
-      {
-        model: 'llama-3.1-8b-instant',
-        messages: [{
-          role: 'user',
-          content: `Patient complaint: "${complaint}". Symptoms: "${symptoms}".
-          Respond ONLY with JSON:
-          {"department": "General/Dental/Cardiology/Neurology", "urgency": "Low/Medium/High", "summary": "one sentence"}`
-        }],
-        max_tokens: 100,
-        temperature: 0.1
-      },
-      { headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' } }
-    );
-    return JSON.parse(response.data.choices[0].message.content);
+    const routingModel = genAI.getGenerativeModel({
+      model: 'gemini-2.0-flash',
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.1,
+        maxOutputTokens: 100,
+      }
+    });
+    const prompt = `Patient complaint: "${complaint}". Symptoms: "${symptoms}". Respond ONLY with JSON: {"department": "General/Dental/Cardiology/Neurology", "urgency": "Low/Medium/High", "summary": "one sentence"}`;
+    const result = await routingModel.generateContent(prompt);
+    return JSON.parse(result.response.text());
   } catch (e) {
     addLog('error', 'AI routing error', e.message);
     return { department: 'General', urgency: 'Low', summary: complaint };
@@ -601,7 +594,7 @@ async function processMessage(phone, message) {
   try {
     aiResponse = await zeroAI(message, history.slice(-20), data, config);
   } catch (e) {
-    addLog('error', 'Groq API error', e.message);
+    addLog('error', 'Gemini API error', e.message);
     return `Sorry, something went wrong on our end. Please send your message again.`;
   }
 
@@ -1011,7 +1004,7 @@ app.get('/api/admin/health', adminAuth, async (req, res) => {
     timestamp: new Date().toISOString(),
     db: 'ok',
     environment: {
-      has_groq_key: !!process.env.GROQ_API_KEY,
+      has_gemini_key: !!process.env.GEMINI_API_KEY,
       has_meta_token: !!process.env.META_ACCESS_TOKEN,
       has_db_url: !!process.env.DATABASE_URL
     }
