@@ -403,7 +403,7 @@ Only include extracted fields you ACTUALLY found. Set is_complete true only when
     parts: [{ text: h.content }]
   }));
   const firstUser = mapped.findIndex(m => m.role === 'user');
-  const geminiHistory = firstUser > 0 ? mapped.slice(firstUser) : mapped;
+  const geminiHistory = firstUser >= 0 ? mapped.slice(firstUser) : [];
 
   const chat = model.startChat({ history: geminiHistory });
   const result = await chat.sendMessage(message);
