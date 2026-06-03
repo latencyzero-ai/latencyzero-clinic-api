@@ -397,10 +397,13 @@ Only include extracted fields you ACTUALLY found. Set is_complete true only when
   });
 
   // Strip timestamps, map 'assistant' → 'model' for Gemini
-  const geminiHistory = history.slice(0, -1).map(h => ({
+  // Gemini requires history to start with 'user' — drop any leading model turns
+  const mapped = history.slice(0, -1).map(h => ({
     role: h.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: h.content }]
   }));
+  const firstUser = mapped.findIndex(m => m.role === 'user');
+  const geminiHistory = firstUser > 0 ? mapped.slice(firstUser) : mapped;
 
   const chat = model.startChat({ history: geminiHistory });
   const result = await chat.sendMessage(message);
