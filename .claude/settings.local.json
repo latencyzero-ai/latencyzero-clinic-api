@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp -r /mnt/c/Users/DELL/Downloads/zero-dashboard-v3/zero-v2/app /mnt/c/Users/DELL/Downloads/zero-dashboard-v2/zero-v2/)",
+      "Bash(cp -r /mnt/c/Users/DELL/Downloads/zero-dashboard-v3/zero-v2/components /mnt/c/Users/DELL/Downloads/zero-dashboard-v2/zero-v2/)",
+      "Bash(cp -r /mnt/c/Users/DELL/Downloads/zero-dashboard-v3/zero-v2/hooks /mnt/c/Users/DELL/Downloads/zero-dashboard-v2/zero-v2/)",
+      "Bash(cp -r /mnt/c/Users/DELL/Downloads/zero-dashboard-v3/zero-v2/lib /mnt/c/Users/DELL/Downloads/zero-dashboard-v2/zero-v2/)",
+      "Bash(cp -r /mnt/c/Users/DELL/Downloads/zero-dashboard-v3/zero-v2/store /mnt/c/Users/DELL/Downloads/zero-dashboard-v2/zero-v2/)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(vercel --prod)"
+    ]
+  }
+}
