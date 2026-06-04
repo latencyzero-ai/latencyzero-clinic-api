@@ -396,9 +396,6 @@ Only include extracted fields you ACTUALLY found. Set is_complete true only when
     }
   });
 
-  // history already has the current user message as its last element.
-  // Map all turns to Gemini format, then drop any leading model turns
-  // (Gemini requires contents to start with a user turn).
   const mapped = history.map(h => ({
     role: h.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: h.content }]
@@ -408,10 +405,36 @@ Only include extracted fields you ACTUALLY found. Set is_complete true only when
     ? mapped.slice(firstUser)
     : [{ role: 'user', parts: [{ text: message }] }];
 
-  const result = await model.generateContent({ contents });
-  return JSON.parse(result.response.text());
-}
+  // ── FIX: wrapped in try/catch with safe JSON parsing ──
+  let rawText = '';
+  try {
+    const result = await model.generateContent({ contents });
+    rawText = result.response.text();
 
+    // Strip markdown fences if Gemini wraps the JSON (happens intermittently)
+    rawText = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+
+    const parsed = JSON.parse(rawText);
+
+    // Validate the shape — if the model returns garbage, throw so we fallback cleanly
+    if (typeof parsed !== 'object' || parsed === null) {
+      throw new Error('Invalid JSON shape from Gemini');
+    }
+
+    return parsed;
+
+  } catch (e) {
+    addLog('error', 'Gemini zeroAI parse/call error', `${e.message} | raw: ${rawText.slice(0, 200)}`);
+    // Return a safe fallback object that keeps the conversation alive
+    // instead of throwing and triggering the generic error message
+    return {
+      reply: "Could you say that again? I want to make sure I get your details right.",
+      extracted: {},
+      is_complete: false,
+      intent: 'collecting'
+    };
+  }
+}
 // ─── AI ROUTING ───────────────────────────────────────
 async function getAIRouting(complaint, symptoms) {
   try {
@@ -594,14 +617,11 @@ async function processMessage(phone, message) {
     return `You don't have an active queue number yet.`;
   }
 
-  // ── CALL ZERO AI ──
-  let aiResponse;
-  try {
-    aiResponse = await zeroAI(message, history.slice(-20), data, config);
-  } catch (e) {
-    addLog('error', 'Gemini API error', e.message);
-    return `Sorry, something went wrong on our end. Please send your message again.`;
-  }
+   // ── CALL ZERO AI ──
+  // zeroAI handles its own errors and returns a safe fallback — no try/catch needed here.
+  // A hard throw from zeroAI would only happen in a truly unexpected scenario,
+  // which the outer webhook try/catch will handle.
+  const aiResponse = await zeroAI(message, history.slice(-20), data, config);
 
   // ── MERGE EXTRACTED DATA ──
   if (aiResponse.extracted) {
