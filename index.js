@@ -779,8 +779,11 @@ app.post('/webhook/whatsapp', async (req, res) => {
       conversationId: phone,
       message: {
         id: msg.id,
-        role: 'patient',
-        content: message,
+        conversation_id: phone,
+        sender: 'PATIENT',
+        body: message,
+        type: 'text',
+        status: 'delivered',
         timestamp: new Date().toISOString()
       }
     });
@@ -792,8 +795,11 @@ app.post('/webhook/whatsapp', async (req, res) => {
       conversationId: phone,
       message: {
         id: `zero_${Date.now()}`,
-        role: 'assistant',
-        content: reply,
+        conversation_id: phone,
+        sender: 'ZERO',
+        body: reply,
+        type: 'text',
+        status: 'delivered',
         timestamp: new Date().toISOString()
       }
     });
@@ -823,17 +829,34 @@ app.post('/webhook/twilio', async (req, res) => {
 app.get('/api/conversations', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT phone as id, phone, state, data,
-       COALESCE(data->>'name', 'Unknown') as patient_name,
-       CASE WHEN data->>'flagged' = 'true' THEN true ELSE false END as flagged,
-       data->>'flag_reason' as flag_reason,
-       CASE WHEN data->>'ai_paused' = 'true' THEN true ELSE false END as is_ai_paused,
-       updated_at
+      `SELECT phone, state, data, created_at, updated_at
        FROM conversations
        WHERE state != 'START'
        ORDER BY updated_at DESC`
     );
-    res.json(result.rows);
+    const rows = result.rows.map(row => {
+      const data = row.data || {};
+      const history = data.history || [];
+      const last = history.length > 0 ? history[history.length - 1] : null;
+      const flagged = data.flagged === true || data.flagged === 'true';
+      const aiPaused = data.ai_paused === true || data.ai_paused === 'true';
+      return {
+        id: row.phone,
+        patient_id: null,
+        patient_name: data.name || 'Unknown',
+        phone_number: row.phone,
+        status: row.state === 'DONE' && !flagged ? 'RESOLVED' : 'OPEN',
+        flagged,
+        flag_reason: data.flag_reason || null,
+        is_ai_paused: aiPaused,
+        last_message: last?.content || null,
+        last_message_at: last?.timestamp || row.updated_at,
+        unread_count: 0,
+        created_at: row.created_at || row.updated_at,
+        updated_at: row.updated_at
+      };
+    });
+    res.json(rows);
   } catch (error) {
     addLog('error', 'GET /api/conversations error', error.message);
     res.status(500).json({ error: error.message });
@@ -849,10 +872,14 @@ app.get('/api/conversations/:id/messages', async (req, res) => {
     const data = conv.rows[0].data || {};
     const history = data.history || [];
 
+    const senderMap = { assistant: 'ZERO', user: 'PATIENT', patient: 'PATIENT' };
     const messages = history.map((h, i) => ({
       id: `msg_${i}`,
-      role: h.role === 'assistant' ? 'assistant' : 'patient',
-      content: h.content,
+      conversation_id: id,
+      sender: senderMap[h.role] || 'PATIENT',
+      body: h.content,
+      type: 'text',
+      status: 'delivered',
       timestamp: h.timestamp || new Date().toISOString()
     }));
 
@@ -870,8 +897,11 @@ app.post('/api/conversations/:id/reply', async (req, res) => {
     await sendWhatsApp(id, body);
     const message = {
       id: `staff_${Date.now()}`,
-      role: 'assistant',
-      content: body,
+      conversation_id: id,
+      sender: 'HUMAN',
+      body,
+      type: 'text',
+      status: 'delivered',
       timestamp: new Date().toISOString()
     };
     io.emit('new_message', { conversationId: id, message });
@@ -884,11 +914,22 @@ app.post('/api/conversations/:id/reply', async (req, res) => {
 app.patch('/api/conversations/:id/resolve', async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query(
-      `UPDATE conversations SET data = jsonb_set(COALESCE(data, '{}'), '{flagged}', 'false'), updated_at = NOW() WHERE phone = $1`,
+    const updated = await pool.query(
+      `UPDATE conversations SET data = jsonb_set(COALESCE(data, '{}'), '{flagged}', 'false'), updated_at = NOW() WHERE phone = $1 RETURNING *`,
       [id]
     );
-    io.emit('conversation_updated', { conversation: { id, flagged: false } });
+    const row = updated.rows[0] || {};
+    const data = row.data || {};
+    const history = data.history || [];
+    const last = history.length > 0 ? history[history.length - 1] : null;
+    const conversation = {
+      id, patient_id: null, patient_name: data.name || 'Unknown', phone_number: id,
+      status: 'RESOLVED', flagged: false, flag_reason: null,
+      is_ai_paused: data.ai_paused === true || data.ai_paused === 'true',
+      last_message: last?.content || null, last_message_at: last?.timestamp || row.updated_at,
+      unread_count: 0, created_at: row.created_at || row.updated_at, updated_at: row.updated_at
+    };
+    io.emit('conversation_updated', { conversation });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -922,12 +963,26 @@ app.get('/api/patients/active', async (req, res) => {
   }
 });
 
+const STATUS_UP = { waiting: 'WAITING', with_doctor: 'WITH_DOCTOR', seen: 'DONE', done: 'DONE', arrived: 'ARRIVED', missed: 'MISSED', cancelled: 'CANCELLED', booked: 'BOOKED' };
+const URGENCY_UP = { low: 'LOW', medium: 'MEDIUM', high: 'HIGH', critical: 'CRITICAL' };
+function normalizePatient(p) {
+  return {
+    ...p,
+    phone_number: p.phone,
+    status: STATUS_UP[p.status?.toLowerCase()] || (p.status?.toUpperCase() ?? 'WAITING'),
+    urgency: URGENCY_UP[p.urgency?.toLowerCase()] || (p.urgency?.toUpperCase() ?? 'LOW'),
+    patient_type: 'WALK_IN',
+    consultation_mode: 'PHYSICAL',
+    arrival_timestamp: p.created_at,
+  };
+}
+
 app.get('/api/patients', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE ORDER BY queue_number ASC`
     );
-    res.json(result.rows);
+    res.json(result.rows.map(normalizePatient));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -970,19 +1025,30 @@ app.get('/api/stats/today', async (req, res) => {
 
 app.patch('/api/patients/:id/status', async (req, res) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status, generate_queue } = req.body;
   const validStatuses = ['waiting', 'seen', 'done', 'cancelled', 'with_doctor', 'WAITING', 'DONE', 'WITH_DOCTOR', 'ARRIVED', 'MISSED', 'CANCELLED'];
   if (!validStatuses.includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
   }
   try {
-    const result = await pool.query(
-      `UPDATE patients SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
-      [status.toLowerCase(), id]
-    );
+    let dbStatus = status.toLowerCase();
+    let result;
+    if (generate_queue) {
+      const queueNumber = await getNextQueueNumber();
+      result = await pool.query(
+        `UPDATE patients SET status = 'waiting', queue_number = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+        [queueNumber, id]
+      );
+    } else {
+      result = await pool.query(
+        `UPDATE patients SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+        [dbStatus, id]
+      );
+    }
     if (result.rows.length === 0) return res.status(404).json({ error: 'Patient not found' });
-    io.emit('queue_updated', { type: 'status_change', patient: result.rows[0] });
-    res.json(result.rows[0]);
+    const patient = normalizePatient(result.rows[0]);
+    io.emit('queue_updated', { type: 'status_change', patient });
+    res.json(patient);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -997,15 +1063,16 @@ app.post('/api/queue/next', async (req, res) => {
     if (current.rows.length === 0) {
       return res.json({ success: false, message: 'No patients in queue', next: null });
     }
-    await pool.query(
-      `UPDATE patients SET status = 'with_doctor', updated_at = NOW() WHERE id = $1`,
+    const updated = await pool.query(
+      `UPDATE patients SET status = 'with_doctor', updated_at = NOW() WHERE id = $1 RETURNING *`,
       [current.rows[0].id]
     );
     await sendWhatsApp(current.rows[0].phone,
       `*Hi ${current.rows[0].name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`
     );
-    io.emit('queue_updated', { type: 'next', patient: current.rows[0] });
-    res.json({ success: true, message: 'Patient called', patient: current.rows[0] });
+    const patient = normalizePatient(updated.rows[0]);
+    io.emit('queue_updated', { type: 'next', patient });
+    res.json({ success: true, patient });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
