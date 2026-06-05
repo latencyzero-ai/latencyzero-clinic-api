@@ -5,9 +5,11 @@ const http = require('http');
 const { Server } = require('socket.io');
 const axios = require('axios');
 const { Pool } = require('pg');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+// const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const Groq = require('groq-sdk');
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -386,30 +388,24 @@ RESPOND ONLY WITH THIS JSON:
 
 Only include extracted fields you ACTUALLY found. Set is_complete true only when ALL required fields are present in CURRENT PATIENT DATA after merging.`;
 
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash',
-    systemInstruction: systemPrompt,
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: 0.3,
-      maxOutputTokens: 500,
-    }
-  });
+const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.map(h => ({
+      role: h.role === 'assistant' ? 'assistant' : 'user',
+      content: h.content
+    }))
+  ];
 
-  const mapped = history.map(h => ({
-    role: h.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: h.content }]
-  }));
-  const firstUser = mapped.findIndex(t => t.role === 'user');
-  const contents = firstUser >= 0
-    ? mapped.slice(firstUser)
-    : [{ role: 'user', parts: [{ text: message }] }];
-
-  // ── FIX: wrapped in try/catch with safe JSON parsing ──
   let rawText = '';
   try {
-    const result = await model.generateContent({ contents });
-    rawText = result.response.text();
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages,
+      temperature: 0.3,
+      max_tokens: 500,
+      response_format: { type: 'json_object' }
+    });
+    rawText = completion.choices[0].message.content;
 
     // Strip markdown fences if Gemini wraps the JSON (happens intermittently)
     rawText = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
@@ -438,17 +434,14 @@ Only include extracted fields you ACTUALLY found. Set is_complete true only when
 // ─── AI ROUTING ───────────────────────────────────────
 async function getAIRouting(complaint, symptoms) {
   try {
-    const routingModel = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.1,
-        maxOutputTokens: 100,
-      }
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      max_tokens: 100,
+      response_format: { type: 'json_object' }
     });
-    const prompt = `Patient complaint: "${complaint}". Symptoms: "${symptoms}". Respond ONLY with JSON: {"department": "General/Dental/Cardiology/Neurology", "urgency": "Low/Medium/High", "summary": "one sentence"}`;
-    const result = await routingModel.generateContent(prompt);
-    return JSON.parse(result.response.text());
+    return JSON.parse(completion.choices[0].message.content);
   } catch (e) {
     addLog('error', 'AI routing error', e.message);
     return { department: 'General', urgency: 'Low', summary: complaint };
