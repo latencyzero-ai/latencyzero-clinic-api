@@ -71,14 +71,29 @@ class SupabaseAdapter extends BaseAdapter {
 
     const { createClient } = requireSupabase();
 
-    if (!adapterConfig.url || !adapterConfig.service_key) {
+    if (!adapterConfig.url) {
+      throw new Error('SupabaseAdapter: adapter_config must include "url".');
+    }
+
+    // Resolve service role key.
+    // Preferred: adapter_config.service_key_env holds the env-var NAME so the
+    // key is never stored in the database. Fallback: adapter_config.service_key
+    // for backwards compatibility with rows created before this convention.
+    const serviceKey = adapterConfig.service_key_env
+      ? process.env[adapterConfig.service_key_env]
+      : adapterConfig.service_key;
+
+    if (!serviceKey) {
       throw new Error(
-        'SupabaseAdapter: adapter_config must include "url" and "service_key".'
+        adapterConfig.service_key_env
+          ? `SupabaseAdapter: env var "${adapterConfig.service_key_env}" is not set on this server. ` +
+            `Add it in Railway → Variables.`
+          : 'SupabaseAdapter: adapter_config must include "service_key" or "service_key_env".'
       );
     }
 
     // Service-role client — stateless, never persists a session.
-    this._client = createClient(adapterConfig.url, adapterConfig.service_key, {
+    this._client = createClient(adapterConfig.url, serviceKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
   }
