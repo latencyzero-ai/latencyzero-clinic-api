@@ -12,6 +12,7 @@ const Groq = require('groq-sdk');
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const crypto = require('crypto');
 
+const multer = require('multer');
 const { loadAdapter } = require('./adapters');
 const { createPharmacyProcessor } = require('./pharmacyFlow');
 
@@ -2302,6 +2303,182 @@ app.post('/api/pharmacy/products/:productId/stock', async (req, res) => {
     res.json({ product: result.rows[0] });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── WEB CHANNEL ─────────────────────────────────────────────────────────────
+// Primary channel for the pharmacy widget. Reuses the pharmacyFlow state
+// machine (same as WhatsApp). Tenant identified by widget_key; identityToken
+// verified server-side via adapter.verifyIdentity.
+
+const RX_UPLOAD = multer({
+  storage   : multer.memoryStorage(),
+  limits    : { fileSize: 10 * 1024 * 1024 }, // 10 MB hard limit
+  fileFilter(_req, file, cb) {
+    const ALLOWED = new Set(['image/jpeg', 'image/png', 'image/webp', 'application/pdf']);
+    if (ALLOWED.has(file.mimetype)) return cb(null, true);
+    const err = new Error('Only JPEG, PNG, WebP images and PDFs are accepted.');
+    err.code = 'INVALID_TYPE';
+    cb(err);
+  },
+});
+
+// Resolve a pharmacy tenant by its public widget key.
+async function resolveByWidgetKey(widgetKey) {
+  const res = await pool.query(
+    'SELECT * FROM pharmacy_config WHERE widget_key = $1 LIMIT 1',
+    [widgetKey]
+  );
+  return res.rows[0] || null;
+}
+
+// Build widget action hints from the post-processing conversation state.
+// Actions tell the widget UI what controls to render after each reply.
+function buildWebActions(state, config) {
+  const actions = [];
+
+  // Prescription upload button — shown whenever the flow is waiting for a file
+  if (state?.machine === 'ACTIVE' && state.phase === 'rx_confirm') {
+    actions.push({
+      type  : 'request_attachment',
+      accept: 'image/jpeg,image/png,image/webp,application/pdf',
+      maxMB : 10,
+      label : 'Send Prescription',
+    });
+  }
+
+  // WhatsApp handoff deep-link — always surfaced when a number is configured
+  if (config.handoff_number) {
+    actions.push({
+      type : 'whatsapp_handoff',
+      url  : `https://wa.me/${config.handoff_number.replace(/[^0-9]/g, '')}`,
+      label: 'Chat on WhatsApp',
+    });
+  }
+
+  return actions;
+}
+
+// POST /api/web/message
+// multipart/form-data: { widgetKey, conversationId?, identityToken?, intent?, text, attachment? }
+// Returns: { conversationId, reply, actions }
+app.post('/api/web/message',
+  // Inline multer error handler so attachment errors return JSON (not Express default HTML)
+  (req, res, next) => {
+    RX_UPLOAD.single('attachment')(req, res, err => {
+      if (!err) return next();
+      const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      const msg    = err.code === 'LIMIT_FILE_SIZE'
+        ? 'Attachment too large. Maximum allowed size is 10 MB.'
+        : (err.message || 'Invalid attachment.');
+      res.status(status).json({ error: msg });
+    });
+  },
+  async (req, res) => {
+    try {
+      const { widgetKey, conversationId, identityToken, intent, text } = req.body;
+      const file = req.file || null;
+
+      // ── Validate required fields ──
+      if (!widgetKey) return res.status(400).json({ error: 'widgetKey is required.' });
+      if (!text && !file) return res.status(400).json({ error: 'text or attachment is required.' });
+
+      // ── Resolve + validate tenant ──
+      const config = await resolveByWidgetKey(widgetKey);
+      if (!config) return res.status(404).json({ error: 'Unknown pharmacy.' });
+      if (!config.active) return res.status(403).json({ error: 'This pharmacy is not currently active.' });
+
+      // ── Load adapter for this tenant ──
+      const adapter = loadAdapter(config, pool);
+
+      // ── Resolve identity ──
+      // Identified: identityToken → adapter.verifyIdentity (server-side, service role)
+      // Guest: use client-supplied conversationId, or generate a new UUID
+      let externalUserId = conversationId || crypto.randomUUID();
+
+      if (identityToken) {
+        try {
+          const identity = await adapter.verifyIdentity(identityToken);
+          if (identity?.externalUserId) externalUserId = identity.externalUserId;
+        } catch (e) {
+          // Invalid/expired token — treat as guest; do not abort the request
+          addLog('warn', 'web identityToken verification failed', e.message);
+        }
+      }
+
+      // ── Build media attachment from multer buffer (no Meta download needed) ──
+      const mediaAttachment = file ? {
+        buffer       : file.buffer,
+        mediaMime    : file.mimetype,
+        mediaFilename: file.originalname || `attachment_${Date.now()}`,
+      } : null;
+
+      // ── Synthesize menu selection from intent hint when no text is provided ──
+      // Lets the widget skip the MENU step programmatically (e.g. an "Order Now" button)
+      const INTENT_MENU = { order: '1', consultation: '2', enquiry: '3' };
+      const effectiveText = text || (intent && INTENT_MENU[intent]) || null;
+
+      // ── Run pharmacy flow ──
+      const reply = await pharmFlow.processPharmacyMessage(
+        externalUserId, effectiveText, mediaAttachment, config, adapter
+      );
+
+      // ── Build widget action hints from the saved post-processing state ──
+      const state   = await pharmFlow.getConvState(externalUserId, config.id);
+      const actions = buildWebActions(state, config);
+
+      res.json({ conversationId: externalUserId, reply, actions });
+    } catch (e) {
+      addLog('error', 'POST /api/web/message', e.message);
+      res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+  }
+);
+
+// POST /api/web/handoff
+// Body: { widgetKey, conversationId? }
+// Flags the conversation for staff review in the dashboard, and returns a
+// wa.me deep-link so the customer can escalate directly on WhatsApp.
+// status 'HANDOFF' is an informal extension of the lifecycle values in
+// pharmacy_conversations; there is no CHECK constraint on that column.
+app.post('/api/web/handoff', async (req, res) => {
+  try {
+    const { widgetKey, conversationId } = req.body;
+
+    if (!widgetKey) return res.status(400).json({ error: 'widgetKey is required.' });
+
+    const config = await resolveByWidgetKey(widgetKey);
+    if (!config) return res.status(404).json({ error: 'Unknown pharmacy.' });
+
+    // Flag the conversation in the DB so the dashboard highlights it
+    let flagged = false;
+    if (conversationId) {
+      const upd = await pool.query(
+        `UPDATE pharmacy_conversations
+         SET status = 'HANDOFF', updated_at = NOW()
+         WHERE external_user_id = $1 AND pharmacy_id = $2
+         RETURNING id`,
+        [conversationId, config.id]
+      );
+      flagged = upd.rows.length > 0;
+      if (flagged) {
+        io.emit('queue_updated', {
+          type          : 'pharmacy_handoff',
+          pharmacyId    : config.id,
+          conversationId,
+        });
+        addLog('info', `Handoff flagged: ${conversationId} | ${config.pharmacy_name}`);
+      }
+    }
+
+    const waLink = config.handoff_number
+      ? `https://wa.me/${config.handoff_number.replace(/[^0-9]/g, '')}`
+      : null;
+
+    res.json({ flagged, whatsapp_link: waLink });
+  } catch (e) {
+    addLog('error', 'POST /api/web/handoff', e.message);
+    res.status(500).json({ error: 'Something went wrong.' });
   }
 });
 

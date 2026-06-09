@@ -588,10 +588,11 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
       // ── PHASE: RX_CONFIRM ────────────────────────────────
       if (phase === 'rx_confirm') {
-        // Media attachment = prescription upload
-        if (mediaAttachment && mediaAttachment.mediaId) {
+        // Media attachment = prescription upload.
+        // Web channel passes { buffer } directly; WhatsApp passes { mediaId } for download.
+        if (mediaAttachment && (mediaAttachment.mediaId || mediaAttachment.buffer)) {
           try {
-            const buffer = await downloadMedia(mediaAttachment.mediaId);
+            const buffer = mediaAttachment.buffer || await downloadMedia(mediaAttachment.mediaId);
             const { url } = await adapter.savePrescription({
               buffer,
               mimetype : mediaAttachment.mediaMime   || 'application/octet-stream',
@@ -754,7 +755,21 @@ Populate extracted fields ONLY when you actually observed them in the customer m
     return `Welcome to ${pharmacyConfig.pharmacy_name}. Send a message to get started.`;
   }
 
-  return { processPharmacyMessage };
+  // ── CONV STATE READER ─────────────────────────────────────────────────────
+  // Called by the web endpoint after processPharmacyMessage to derive widget
+  // action hints without re-running the flow.
+
+  async function getConvState(externalUserId, pharmacyId) {
+    const res = await pool.query(
+      'SELECT state FROM pharmacy_conversations WHERE external_user_id = $1 AND pharmacy_id = $2',
+      [externalUserId, pharmacyId]
+    );
+    if (!res.rows.length) return null;
+    const raw = res.rows[0].state;
+    return typeof raw === 'string' ? JSON.parse(raw) : (raw || null);
+  }
+
+  return { processPharmacyMessage, getConvState };
 }
 
 module.exports = { createPharmacyProcessor };
