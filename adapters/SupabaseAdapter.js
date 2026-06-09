@@ -1,0 +1,322 @@
+'use strict';
+
+// ─── SUPABASE ADAPTER — OCHESTA BACKEND ───────────────────────────────────────
+// Implements the BaseAdapter interface against Ochesta's Supabase project.
+//
+// Ochesta schema
+// ──────────────
+// products : id, name, category, description, price, stock_qty,
+//            image_url, requires_prescription
+//
+// orders   : id TEXT ('OCP-XXXXXX'), customer_name, customer_phone,
+//            total_amount NUMERIC, status TEXT ('pending'),
+//            items JSONB {
+//              cart         : [{product_id, name, price, quantity}],
+//              customer_id  : string,          ← our Supabase UUID (for history lookup)
+//              customer_email, delivery_address, delivery_city,
+//              prescription_url, subtotal, delivery_fee, total,
+//              payment_method
+//            }
+//
+// Storage  : 'prescriptions' bucket, 'product-images' bucket
+//
+// Auth     : Supabase Auth — user_metadata: { firstName, lastName, phone }
+//
+// adapter_config shape (JSONB column in pharmacy_config; never returned to clients):
+// {
+//   "url"         : "https://<project>.supabase.co",
+//   "service_key" : "eyJ..."   ← service_role key — server-side ONLY, never the anon key
+// }
+//
+// SECURITY
+// ────────
+// • service_key is the Supabase SERVICE ROLE key.  It bypasses RLS.
+// • It is read from adapter_config (our private DB column) — never hardcoded,
+//   never logged, never returned in any API response.
+// • All writes go through this server-side client.  The anon key is never used.
+//
+// Atomic stock decrement (install once in Supabase SQL editor — optional but
+// strongly recommended for production):
+//
+//   CREATE OR REPLACE FUNCTION decrement_stock(items jsonb)
+//   RETURNS void LANGUAGE plpgsql AS $$
+//   DECLARE r jsonb;
+//   BEGIN
+//     FOR r IN SELECT * FROM jsonb_array_elements(items)
+//     LOOP
+//       UPDATE products
+//         SET stock_qty = GREATEST(stock_qty - (r->>'qty')::int, 0)
+//         WHERE id = (r->>'product_id');
+//     END LOOP;
+//   END; $$;
+//
+// Without the RPC the adapter falls back to per-item UPDATEs (not atomic).
+
+const { BaseAdapter } = require('./interface');
+const crypto = require('crypto');
+
+function requireSupabase() {
+  try {
+    return require('@supabase/supabase-js');
+  } catch {
+    throw new Error(
+      'SupabaseAdapter requires @supabase/supabase-js — run: npm install @supabase/supabase-js'
+    );
+  }
+}
+
+class SupabaseAdapter extends BaseAdapter {
+  constructor(adapterConfig) {
+    super(adapterConfig);
+
+    const { createClient } = requireSupabase();
+
+    if (!adapterConfig.url || !adapterConfig.service_key) {
+      throw new Error(
+        'SupabaseAdapter: adapter_config must include "url" and "service_key".'
+      );
+    }
+
+    // Service-role client — stateless, never persists a session.
+    this._client = createClient(adapterConfig.url, adapterConfig.service_key, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  }
+
+  // ── IDENTITY ──────────────────────────────────────────────────────────────
+
+  // Validates a Supabase JWT server-side using the service-role client.
+  // Returns null for missing, expired, or invalid tokens.
+  //
+  // token → { externalUserId, name, email, phone } | null
+  async verifyIdentity(token) {
+    if (!token) return null;
+
+    const { data, error } = await this._client.auth.getUser(token);
+    if (error || !data?.user) return null;
+
+    const u    = data.user;
+    const meta = u.user_metadata || {};
+
+    // Ochesta stores name split into firstName + lastName in user_metadata.
+    const firstName = meta.firstName || meta.first_name  || '';
+    const lastName  = meta.lastName  || meta.last_name   || '';
+    const name      = [firstName, lastName].filter(Boolean).join(' ') || null;
+
+    return {
+      externalUserId : u.id,
+      name           : name,
+      email          : u.email                   || null,
+      phone          : meta.phone || u.phone     || null,
+    };
+  }
+
+  // ── CATALOGUE ─────────────────────────────────────────────────────────────
+
+  // Returns Ochesta's product catalogue.
+  // Ochesta's schema has no 'active' column — every row is live.
+  // opts.query    : string — ilike filter on name
+  // opts.category : string — exact match on category
+  async getProducts({ query, category } = {}) {
+    let q = this._client
+      .from('products')
+      .select('id, name, category, description, price, stock_qty, image_url, requires_prescription')
+      .order('name', { ascending: true });
+
+    if (category) q = q.eq('category', category);
+    if (query)    q = q.ilike('name', `%${query}%`);
+
+    const { data, error } = await q;
+    if (error) throw new Error(`SupabaseAdapter.getProducts: ${error.message}`);
+
+    return (data || []).map(p => ({
+      id                    : p.id,
+      name                  : p.name,
+      category              : p.category              || null,
+      description           : p.description           || null,
+      price                 : parseFloat(p.price),
+      stock_qty             : p.stock_qty              ?? 0,
+      image_url             : p.image_url              || null,
+      requires_prescription : p.requires_prescription ?? false,
+    }));
+  }
+
+  // Returns current stock_qty for a single product. Returns 0 if not found.
+  async checkStock(productId) {
+    const { data, error } = await this._client
+      .from('products')
+      .select('stock_qty')
+      .eq('id', productId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return 0; // no row — treat as out of stock
+      throw new Error(`SupabaseAdapter.checkStock: ${error.message}`);
+    }
+
+    return data?.stock_qty ?? 0;
+  }
+
+  // ── PRESCRIPTION ──────────────────────────────────────────────────────────
+
+  // Uploads to Ochesta's 'prescriptions' storage bucket.
+  // Returns { url } — a publicly accessible URL for the uploaded file.
+  //
+  // file : { buffer: Buffer, mimetype: string, filename: string }
+  async savePrescription(file) {
+    const ext  = file.filename.includes('.') ? file.filename.split('.').pop() : 'bin';
+    const path = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+
+    const { data, error } = await this._client.storage
+      .from('prescriptions')
+      .upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
+
+    if (error) throw new Error(`SupabaseAdapter.savePrescription: ${error.message}`);
+
+    const { data: urlData } = this._client.storage
+      .from('prescriptions')
+      .getPublicUrl(data.path);
+
+    return { url: urlData.publicUrl };
+  }
+
+  // ── ORDERS ────────────────────────────────────────────────────────────────
+
+  // Inserts a confirmed order into Ochesta's orders table.
+  //
+  // Key Ochesta differences from the generic interface:
+  //   • id is a TEXT primary key generated here as 'OCP-XXXXXX'
+  //   • items is a single JSONB column (no separate order_items table)
+  //   • Ochesta cart items use {product_id, name, price, quantity} — not
+  //     {product_id, name_snap, price_snap, qty}
+  //   • total_amount (not total) is the top-level money field on the row
+  //   • status is lowercase 'pending'
+  //
+  // Money totals (subtotal, delivery_fee, total) are computed in the calling
+  // code and passed verbatim — this method does zero arithmetic.
+  //
+  // Standard interface fields (always required):
+  //   orderObj.customer_id     — Supabase user UUID (embedded in items JSONB
+  //                               as customer_id for order history lookup)
+  //   orderObj.items[]         — {product_id, name_snap, price_snap, qty}
+  //   orderObj.subtotal        — pre-computed
+  //   orderObj.delivery_fee    — pre-computed (0 for PICKUP)
+  //   orderObj.total           — pre-computed subtotal + delivery_fee
+  //   orderObj.fulfilment      — 'DELIVERY' | 'PICKUP'
+  //   orderObj.delivery_area   — area string or null
+  //   orderObj.notes           — free text or null
+  //
+  // Extended Ochesta-specific fields (optional; null when not provided):
+  //   orderObj.customer_name     — written to orders.customer_name
+  //   orderObj.customer_phone    — written to orders.customer_phone
+  //   orderObj.customer_email    — embedded in items JSONB
+  //   orderObj.delivery_address  — embedded in items JSONB (falls back to delivery_area)
+  //   orderObj.delivery_city     — embedded in items JSONB
+  //   orderObj.prescription_url  — embedded in items JSONB
+  //   orderObj.payment_method    — embedded in items JSONB
+  async createOrder(orderObj) {
+    // Map our interface cart shape → Ochesta's cart shape.
+    // Our: { product_id, name_snap, price_snap, qty }
+    // Ochesta: { product_id, name, price, quantity }
+    const cart = orderObj.items.map(i => ({
+      product_id : i.product_id,
+      name       : i.name_snap,
+      price      : i.price_snap,
+      quantity   : i.qty,
+    }));
+
+    const itemsPayload = {
+      cart,
+      customer_id      : orderObj.customer_id,
+      customer_email   : orderObj.customer_email    || null,
+      delivery_address : orderObj.delivery_address  || orderObj.delivery_area || null,
+      delivery_city    : orderObj.delivery_city      || null,
+      prescription_url : orderObj.prescription_url   || null,
+      subtotal         : orderObj.subtotal,
+      delivery_fee     : orderObj.delivery_fee       || 0,
+      total            : orderObj.total,
+      payment_method   : orderObj.payment_method     || null,
+    };
+
+    // Generate a unique OCP-XXXXXX ID and retry on the rare duplicate collision.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const orderId = `OCP-${Math.floor(100000 + Math.random() * 900000)}`;
+
+      const { data, error } = await this._client
+        .from('orders')
+        .insert({
+          id             : orderId,
+          customer_name  : orderObj.customer_name  || null,
+          customer_phone : orderObj.customer_phone || null,
+          total_amount   : orderObj.total,
+          status         : 'pending',
+          items          : itemsPayload,
+        })
+        .select('id')
+        .single();
+
+      if (!error) return { orderId: data.id };
+
+      // 23505 = unique_violation — another order already has this ID, try again.
+      if (error.code === '23505') continue;
+
+      throw new Error(`SupabaseAdapter.createOrder: ${error.message}`);
+    }
+
+    throw new Error(
+      'SupabaseAdapter.createOrder: failed to generate a unique OCP order ID after 5 attempts.'
+    );
+  }
+
+  // Decrements products.stock_qty for every item in a confirmed order.
+  //
+  // Preferred path: calls the Supabase RPC 'decrement_stock' (atomic).
+  // Fallback: individual UPDATE statements — not atomic; a partial failure
+  // leaves stock inconsistent. Install the RPC to avoid this.
+  //
+  // items : Array<{ product_id: string | number, qty: number }>
+  async decrementStock(items) {
+    const { error: rpcErr } = await this._client.rpc('decrement_stock', { items });
+    if (!rpcErr) return; // RPC succeeded — stock updated atomically
+
+    console.warn(
+      '[SupabaseAdapter] decrement_stock RPC unavailable — falling back to per-item UPDATEs ' +
+      '(not atomic). Install the decrement_stock function in Supabase SQL editor to fix this.'
+    );
+
+    for (const item of items) {
+      const current = await this.checkStock(item.product_id);
+      const newQty  = Math.max(current - item.qty, 0);
+
+      const { error } = await this._client
+        .from('products')
+        .update({ stock_qty: newQty })
+        .eq('id', item.product_id);
+
+      if (error) {
+        throw new Error(
+          `SupabaseAdapter.decrementStock (product ${item.product_id}): ${error.message}`
+        );
+      }
+    }
+  }
+
+  // ── ORDER HISTORY ─────────────────────────────────────────────────────────
+
+  // Returns the 20 most recent orders for a customer.
+  // Orders the Supabase UUID stored in items->>'customer_id' at creation time.
+  // Returns [] (not null) when no orders are found.
+  async getCustomerOrders(externalUserId) {
+    const { data, error } = await this._client
+      .from('orders')
+      .select('id, customer_name, customer_phone, total_amount, status, items, created_at')
+      .filter('items->>customer_id', 'eq', externalUserId)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) throw new Error(`SupabaseAdapter.getCustomerOrders: ${error.message}`);
+    return data || [];
+  }
+}
+
+module.exports = { SupabaseAdapter };
