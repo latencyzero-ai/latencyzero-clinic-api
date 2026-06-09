@@ -55,6 +55,45 @@ function fuzzyMatch(query, products) {
     .sort((a, b) => b._score - a._score);
 }
 
+// Returns "Good morning / afternoon / evening" in the pharmacy's local timezone.
+function getDaypart(timezone) {
+  try {
+    const h = parseInt(
+      new Date().toLocaleString('en-US', {
+        timeZone: timezone || 'Africa/Lagos',
+        hour    : 'numeric',
+        hour12  : false,
+      }),
+      10
+    );
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    return 'Good evening';
+  } catch {
+    const h = new Date().getHours();
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    return 'Good evening';
+  }
+}
+
+// Compact, non-diagnostic order summary for in-session reorder context.
+// Stores: order ID, date, item names + quantities, total amount ONLY.
+// Delivery address, notes, and diagnostic fields are deliberately excluded.
+function formatRecentOrders(orders) {
+  return (orders || []).slice(0, 3).map(o => {
+    const cart = o.items?.cart || [];
+    return {
+      id   : o.id,
+      date : (o.created_at || '').split('T')[0] || null,
+      items: cart
+        .map(i => ({ product_id: i.product_id, name: i.name || i.name_snap, qty: Number(i.quantity || i.qty || 1) }))
+        .filter(i => i.name),
+      total: Number(o.total_amount || o.items?.total || 0),
+    };
+  }).filter(o => o.items.length > 0);
+}
+
 // ─── FACTORY ──────────────────────────────────────────────────────────────────
 
 function createPharmacyProcessor({ pool, groq, io, addLog, sendWhatsApp, getGreeting, META_API, ACCESS_TOKEN }) {
@@ -115,7 +154,7 @@ function createPharmacyProcessor({ pool, groq, io, addLog, sendWhatsApp, getGree
   // History is stripped to {role, content} before the API call (no timestamps).
   // Markdown fences are stripped before JSON.parse.
 
-  async function pharmacyAI(message, history, stateData, products, pharmacyName) {
+  async function pharmacyAI(message, history, stateData, products, pharmacyName, recentOrders) {
     const productList = products.length
       ? products.map(p =>
           `  ${p.name}  (${p.requires_prescription ? 'Rx required' : 'OTC'}, ` +
@@ -134,6 +173,17 @@ function createPharmacyProcessor({ pool, groq, io, addLog, sendWhatsApp, getGree
       delivery_area  : stateData.delivery_area || null,
     };
 
+    const orders = (recentOrders || []);
+    const orderHistorySection = orders.length
+      ? `\nCUSTOMER'S RECENT ORDERS (reference for reorder suggestions only — do not add medical context):\n` +
+        orders.map((o, i) =>
+          `  ${i + 1}. ${o.id} (${o.date}): ${o.items.map(item => `${item.name} x${item.qty}`).join(', ')}`
+        ).join('\n') +
+        `\n\nREORDER RULE: If the customer asks to reorder or wants "the same as last time", set\n` +
+        `reorder_intent to the order ID or "last" for the most recent order.\n` +
+        `The server rebuilds the cart at current prices — NEVER state or guess a price.\n`
+      : '';
+
     const systemPrompt =
 `You are Zara, an order assistant for ${pharmacyName}.
 Your ONLY role is to help customers place product orders. You NEVER give medical advice, dosage guidance, or drug-interaction information. If asked, say exactly: "I can only help with your order. Please speak to a pharmacist for medical questions." — then stop.
@@ -143,7 +193,7 @@ ${productList}
 
 CURRENT ORDER STATE:
 ${JSON.stringify(snap)}
-
+${orderHistorySection}
 YOUR JOB:
 Read the current state. Ask for ONLY the next missing piece. One question at a time.
 
@@ -174,7 +224,8 @@ RESPOND WITH THIS JSON ONLY — no text outside the JSON object:
     "qty": null,
     "fulfilment": null,
     "delivery_area": null,
-    "rx_confirmed": null
+    "rx_confirmed": null,
+    "reorder_intent": null
   },
   "intent": "collecting"
 }
@@ -270,9 +321,93 @@ Populate extracted fields ONLY when you actually observed them in the customer m
     return reply;
   }
 
+  // ── REORDER ───────────────────────────────────────────────────────────────
+  // Rebuilds a prior order's cart at CURRENT prices. Old price_snap values are NEVER reused.
+  // reorderIntent: 'last' | order ID string (e.g. 'OCP-123456')
+
+  async function handleReorder(reorderIntent, state, history, externalUserId, pharmacyConfig, adapter, now) {
+    const currency     = pharmacyConfig.currency || 'NGN';
+    const recentOrders = state.recent_orders || [];
+
+    let targetOrder = null;
+    if (reorderIntent === 'last') {
+      targetOrder = recentOrders[0] || null;
+    } else {
+      targetOrder = recentOrders.find(
+        o => o.id === reorderIntent || o.id === `OCP-${reorderIntent}`
+      ) || null;
+    }
+
+    if (!targetOrder || !targetOrder.items?.length) {
+      const reply = recentOrders.length === 0
+        ? `I don't see any previous orders on file. What product are you looking for?`
+        : `I couldn't find that order. Here are your recent orders:\n\n` +
+          recentOrders.map(o => `${o.id}: ${o.items.map(i => `${i.name} x${i.qty}`).join(', ')}`).join('\n') +
+          `\n\nWhich would you like to reorder?`;
+      state.phase = 'product';
+      delete state.pending_reorder;
+      history.push({ role: 'assistant', content: reply, timestamp: now });
+      await saveConv(externalUserId, pharmacyConfig.id, state, history);
+      return reply;
+    }
+
+    // Fetch current catalogue — never use stored prices from prior order
+    const allProducts = await adapter.getProducts();
+    const productMap  = new Map(allProducts.map(p => [String(p.id), p]));
+    const newCart     = [];
+    const skipped     = [];
+
+    for (const item of targetOrder.items) {
+      const product = productMap.get(String(item.product_id));
+      if (!product) { skipped.push(item.name); continue; }
+      const avail = await adapter.checkStock(item.product_id);
+      if (avail <= 0) { skipped.push(item.name); continue; }
+      newCart.push({
+        product_id            : product.id,
+        name_snap             : product.name,
+        price_snap            : parseFloat(product.price), // CURRENT price — not old price_snap
+        qty                   : Math.min(item.qty, avail),
+        requires_prescription : product.requires_prescription || false,
+      });
+    }
+
+    if (newCart.length === 0) {
+      const reply =
+        `Sorry, the items from order ${targetOrder.id} are not in stock right now.\n\n` +
+        `What else are you looking for?`;
+      state.phase = 'product';
+      state.cart  = [];
+      delete state.pending_reorder;
+      history.push({ role: 'assistant', content: reply, timestamp: now });
+      await saveConv(externalUserId, pharmacyConfig.id, state, history);
+      return reply;
+    }
+
+    state.cart  = newCart;
+    state.phase = 'more_or_checkout';
+    delete state.pending_reorder;
+
+    const cartLines = newCart.map(i =>
+      `${i.name_snap} x${i.qty}  ${formatCurrency(i.price_snap * i.qty, currency)}`
+    );
+    const subtotal = newCart.reduce((s, i) => s + i.price_snap * i.qty, 0);
+
+    let reply =
+      `Here's your cart rebuilt with today's prices:\n\nCart:\n${cartLines.join('\n')}\n` +
+      `Subtotal: ${formatCurrency(subtotal, currency)}`;
+    if (skipped.length) {
+      reply += `\n\n(${skipped.join(', ')} ${skipped.length === 1 ? 'is' : 'are'} currently out of stock and not included.)`;
+    }
+    reply += `\n\nWould you like to add anything else, or type *checkout* to proceed?`;
+
+    history.push({ role: 'assistant', content: reply, timestamp: now });
+    await saveConv(externalUserId, pharmacyConfig.id, state, history);
+    return reply;
+  }
+
   // ── MAIN PROCESSOR ────────────────────────────────────────────────────────
 
-  async function processPharmacyMessage(externalUserId, message, mediaAttachment, pharmacyConfig, adapter) {
+  async function processPharmacyMessage(externalUserId, message, mediaAttachment, pharmacyConfig, adapter, identity = null) {
     const conv = await getConv(externalUserId, pharmacyConfig.id);
 
     const msg      = (message || '').trim().toLowerCase();
@@ -291,23 +426,49 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
     // ── START → MENU ──
     if (state.machine === 'START') {
-      const greeting = getGreeting();
+      const daypart   = getDaypart(pharmacyConfig.timezone);
+      const firstName = identity?.name?.split(' ')[0] || null;
+      const greeting  = firstName ? `${daypart}, ${firstName}.` : `${daypart}.`;
+
+      // Load compact order history for identified users — session context only, no diagnostic fields.
+      let recentOrders = [];
+      if (identity?.externalUserId) {
+        try {
+          const raw = await adapter.getCustomerOrders(identity.externalUserId);
+          recentOrders = formatRecentOrders(raw);
+        } catch (e) {
+          addLog('warn', 'getCustomerOrders failed on START', e.message);
+        }
+      }
+
       const welcome =
-        `${greeting}. Welcome to *${pharmacyConfig.pharmacy_name}*.\n\n` +
+        `${greeting} Welcome${recentOrders.length ? ' back' : ''} to *${pharmacyConfig.pharmacy_name}*.\n\n` +
         `I'm Zara, your pharmacy assistant. How can I help you today?\n\n` +
         `1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
+
       history = [{ role: 'assistant', content: welcome, timestamp: now }];
-      await saveConv(externalUserId, pharmacyConfig.id, { machine: 'MENU' }, history);
+      await saveConv(externalUserId, pharmacyConfig.id, {
+        machine            : 'MENU',
+        recent_orders      : recentOrders,
+        customer_first_name: firstName,
+      }, history);
       return welcome;
     }
 
     // ── DONE → return to MENU ──
     if (state.machine === 'DONE') {
+      const firstName = state.customer_first_name || null;
+      const daypart   = getDaypart(pharmacyConfig.timezone);
+      const greeting  = firstName ? `${daypart}, ${firstName}.` : `${daypart}.`;
       const welcome =
-        `Welcome back to *${pharmacyConfig.pharmacy_name}*. How can I help?\n\n` +
+        `${greeting} Welcome back to *${pharmacyConfig.pharmacy_name}*. How can I help?\n\n` +
         `1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
       history = [{ role: 'assistant', content: welcome, timestamp: now }];
-      await saveConv(externalUserId, pharmacyConfig.id, { machine: 'MENU' }, history);
+      await saveConv(externalUserId, pharmacyConfig.id, {
+        machine            : 'MENU',
+        recent_orders      : state.recent_orders || [],
+        customer_first_name: firstName,
+      }, history);
       return welcome;
     }
 
@@ -318,7 +479,17 @@ Populate extracted fields ONLY when you actually observed them in the customer m
       let nextPhase = null;
       let intro     = '';
 
-      if (msg === '1' || msg.includes('order') || msg.includes('buy') || msg.includes('purchase') || msg.includes('need')) {
+      // Reorder shortcut — checked before the general 'order' keyword
+      if (msg.includes('reorder') || msg.includes('same as last') || msg.includes('last order') || msg.includes('order again')) {
+        nextPhase = 'product';
+        const hasHistory = (state.recent_orders || []).length > 0;
+        if (hasHistory) {
+          state.pending_reorder = 'last';
+          intro = `Let me rebuild your last order with today's prices.`;
+        } else {
+          intro = `What product are you looking for? Tell me the name and I'll find it.`;
+        }
+      } else if (msg === '1' || msg.includes('order') || msg.includes('buy') || msg.includes('purchase') || msg.includes('need')) {
         nextPhase = 'product';
         intro = `What product are you looking for? Tell me the name and I'll find it.`;
       } else if (msg === '2' || msg.includes('consult') || msg.includes('appointment') || msg.includes('see a doctor') || msg.includes('book')) {
@@ -331,7 +502,14 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
       if (nextPhase) {
         history.push({ role: 'assistant', content: intro, timestamp: now });
-        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'ACTIVE', phase: nextPhase, cart: [] }, history);
+        await saveConv(externalUserId, pharmacyConfig.id, {
+          machine            : 'ACTIVE',
+          phase              : nextPhase,
+          cart               : [],
+          pending_reorder    : state.pending_reorder || null,
+          recent_orders      : state.recent_orders || [],
+          customer_first_name: state.customer_first_name || null,
+        }, history);
         return intro;
       }
 
@@ -351,6 +529,11 @@ Populate extracted fields ONLY when you actually observed them in the customer m
       }
 
       const phase = state.phase;
+
+      // Auto-execute reorder if MENU detected reorder intent before AI was involved
+      if (state.pending_reorder) {
+        return await handleReorder(state.pending_reorder, state, history, externalUserId, pharmacyConfig, adapter, now);
+      }
 
       // ════════════════════════════════════════════════════
       // CONSULTATION FLOW
@@ -377,7 +560,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
           `Thank you. Your request has been passed to our pharmacist and someone will be in touch with you shortly.\n\n` +
           `Anything else I can help with?\n\n1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
         history.push({ role: 'assistant', content: done, timestamp: now });
-        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE' }, history, 'DONE');
+        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || null }, history, 'DONE');
         return done;
       }
 
@@ -406,7 +589,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
           `Your question has been passed on. We will get back to you shortly.\n\n` +
           `Anything else?\n\n1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
         history.push({ role: 'assistant', content: done, timestamp: now });
-        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE' }, history, 'DONE');
+        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || null }, history, 'DONE');
         return done;
       }
 
@@ -477,7 +660,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
           }
 
           history.push({ role: 'assistant', content: confirmMsg, timestamp: now });
-          await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE' }, history, 'DONE');
+          await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || null }, history, 'DONE');
           io.emit('queue_updated', { type: 'pharmacy_order', orderId, pharmacyId: pharmacyConfig.id, needsRx });
           addLog('info', `Order ${orderId} | ${pharmacyConfig.pharmacy_name} | ${formatCurrency(total, currency)}`);
           return confirmMsg;
@@ -537,7 +720,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
         // Ask AI for delivery intent disambiguation
         const allProds = await adapter.getProducts();
-        const aiResp = await pharmacyAI(message, history.slice(-20), state, allProds, pharmacyConfig.pharmacy_name);
+        const aiResp = await pharmacyAI(message, history.slice(-20), state, allProds, pharmacyConfig.pharmacy_name, state.recent_orders || []);
 
         if (aiResp.extracted?.fulfilment && !state.fulfilment) {
           state.fulfilment = aiResp.extracted.fulfilment.toUpperCase();
@@ -668,7 +851,12 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
       // ── AI CALL ───────────────────────────────────────────────────────────
       const allProducts = await adapter.getProducts();
-      const aiResp = await pharmacyAI(message || '', history.slice(-20), state, allProducts, pharmacyConfig.pharmacy_name);
+      const aiResp = await pharmacyAI(message || '', history.slice(-20), state, allProducts, pharmacyConfig.pharmacy_name, state.recent_orders || []);
+
+      // ── REORDER INTENT FROM AI ────────────────────────────────────────────
+      if (aiResp.extracted?.reorder_intent) {
+        return await handleReorder(aiResp.extracted.reorder_intent, state, history, externalUserId, pharmacyConfig, adapter, now);
+      }
 
       // ── PRODUCT NAME EXTRACTION → server fuzzy match ──────────────────────
       if (aiResp.extracted?.product_name_mentioned && !state.product_id) {

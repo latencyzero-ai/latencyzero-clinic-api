@@ -2396,10 +2396,11 @@ app.post('/api/web/message',
       // Guest: use client-supplied conversationId, or generate a new UUID
       let externalUserId = conversationId || crypto.randomUUID();
 
+      let resolvedIdentity = null;
       if (identityToken) {
         try {
-          const identity = await adapter.verifyIdentity(identityToken);
-          if (identity?.externalUserId) externalUserId = identity.externalUserId;
+          resolvedIdentity = await adapter.verifyIdentity(identityToken);
+          if (resolvedIdentity?.externalUserId) externalUserId = resolvedIdentity.externalUserId;
         } catch (e) {
           // Invalid/expired token — treat as guest; do not abort the request
           addLog('warn', 'web identityToken verification failed', e.message);
@@ -2420,7 +2421,7 @@ app.post('/api/web/message',
 
       // ── Run pharmacy flow ──
       const reply = await pharmFlow.processPharmacyMessage(
-        externalUserId, effectiveText, mediaAttachment, config, adapter
+        externalUserId, effectiveText, mediaAttachment, config, adapter, resolvedIdentity
       );
 
       // ── Build widget action hints from the saved post-processing state ──
