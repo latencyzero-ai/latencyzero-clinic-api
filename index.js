@@ -10,10 +10,17 @@ const { Pool } = require('pg');
 // const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const Groq = require('groq-sdk');
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const crypto = require('crypto');
+
+const { loadAdapter } = require('./adapters');
+const { createPharmacyProcessor } = require('./pharmacyFlow');
 
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+// Capture raw body on every JSON request — needed by /webhook/payment for HMAC verification
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── HTTP + SOCKET.IO SERVER ──────────────────────────
@@ -81,6 +88,19 @@ function getGreeting() {
   return 'Good evening';
 }
 
+// ─── PHARMACY FLOW ENGINE ─────────────────────────────
+// Instantiated once; adapter is loaded per-request inside the webhook.
+const pharmFlow = createPharmacyProcessor({
+  pool,
+  groq,
+  io,
+  addLog,
+  sendWhatsApp,
+  getGreeting,
+  META_API,
+  ACCESS_TOKEN,
+});
+
 // ─── GET CLINIC CONFIG ────────────────────────────────
 async function getConfig() {
   const result = await pool.query('SELECT * FROM clinic_config LIMIT 1');
@@ -116,6 +136,36 @@ async function updateConversation(phone, state, data) {
   );
 }
 
+// ─── PHARMACY CONVERSATION HELPERS ────────────────────
+// Uses the separate pharmacy_conversations table so clinic and
+// pharmacy state machines never share rows for the same phone.
+async function getPharmacyConversation(phone, pharmacyId) {
+  const result = await pool.query(
+    'SELECT * FROM pharmacy_conversations WHERE phone = $1 AND pharmacy_id = $2',
+    [phone, pharmacyId]
+  );
+  if (result.rows.length === 0) {
+    const inserted = await pool.query(
+      `INSERT INTO pharmacy_conversations (pharmacy_id, phone, state, data)
+       VALUES ($1, $2, 'START', $3) RETURNING *`,
+      [pharmacyId, phone, JSON.stringify({ cart: [] })]
+    );
+    return { ...inserted.rows[0], data: { cart: [] } };
+  }
+  const row = result.rows[0];
+  return { ...row, data: row.data || { cart: [] } };
+}
+
+async function updatePharmacyConversation(phone, pharmacyId, state, data) {
+  await pool.query(
+    `INSERT INTO pharmacy_conversations (pharmacy_id, phone, state, data, updated_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (pharmacy_id, phone) DO UPDATE
+     SET state = $3, data = $4, updated_at = NOW()`,
+    [pharmacyId, phone, state, JSON.stringify(data)]
+  );
+}
+
 // ─── GET NEXT QUEUE NUMBER ────────────────────────────
 async function getNextQueueNumber() {
   const today = new Date().toISOString().split('T')[0];
@@ -130,11 +180,11 @@ async function getNextQueueNumber() {
 }
 
 // ─── SEND WHATSAPP VIA META ───────────────────────────
-async function sendWhatsApp(to, message) {
+async function sendWhatsApp(to, message, phoneNumberId = PHONE_NUMBER_ID) {
   try {
     const cleanPhone = to.replace(/[^0-9]/g, '');
     await axios.post(
-      `${META_API}/${PHONE_NUMBER_ID}/messages`,
+      `${META_API}/${phoneNumberId}/messages`,
       {
         messaging_product: 'whatsapp',
         to: cleanPhone,
@@ -152,6 +202,32 @@ async function sendWhatsApp(to, message) {
   } catch (e) {
     addLog('error', 'WhatsApp send error', e.response?.data || e.message);
   }
+}
+
+// ─── TENANT RESOLUTION ────────────────────────────────
+// Looks up the incoming phone_number_id in pharmacy_config.
+// Returns PHARMACY (active), PHARMACY_INACTIVE (kill switch engaged),
+// or CLINIC (no pharmacy row — fall through to clinic flow).
+// Kill switch: set pharmacy_config.active = false in the DB;
+// Zero stops responding for that tenant on the very next message.
+async function resolveTenant(phoneNumberId) {
+  if (!phoneNumberId) return { business_type: 'CLINIC', config: null };
+  try {
+    const result = await pool.query(
+      'SELECT * FROM pharmacy_config WHERE phone_number_id = $1 LIMIT 1',
+      [phoneNumberId]
+    );
+    if (result.rows.length > 0) {
+      const row = result.rows[0];
+      return {
+        business_type: row.active ? 'PHARMACY' : 'PHARMACY_INACTIVE',
+        config: row,
+      };
+    }
+  } catch (e) {
+    addLog('error', 'Tenant resolution error', e.message);
+  }
+  return { business_type: 'CLINIC', config: null };
 }
 
 // ─── NOTIFY CLINIC ────────────────────────────────────
@@ -420,7 +496,7 @@ const messages = [
     return parsed;
 
   } catch (e) {
-    addLog('error', 'Gemini zeroAI parse/call error', `${e.message} | raw: ${rawText.slice(0, 200)}`);
+    addLog('error', 'Groq zeroAI parse/call error', `${e.message} | raw: ${rawText.slice(0, 200)}`);
     // Return a safe fallback object that keeps the conversation alive
     // instead of throwing and triggering the generic error message
     return {
@@ -433,9 +509,10 @@ const messages = [
 }
 // ─── AI ROUTING ───────────────────────────────────────
 async function getAIRouting(complaint, symptoms) {
+  const prompt = `Classify this clinic patient's complaint.\n\nComplaint: ${complaint}\nSymptoms: ${symptoms || 'none provided'}\n\nReturn JSON only: {"department": "...", "urgency": "Low|Medium|High", "summary": "one-line summary"}\n\nDepartment options: General, Dental, Cardiology, Neurology, Respiratory, Gastroenterology, Dermatology, ENT, Orthopaedics, Gynaecology, Ophthalmology, Laboratory`;
   try {
     const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'llama-3.1-8b-instant',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.1,
       max_tokens: 100,
@@ -732,6 +809,657 @@ async function processMessage(phone, message) {
   return aiResponse.reply;
 }
 
+// ─── PHARMACY UTILITIES ───────────────────────────────
+
+function formatCurrency(amount, currency = 'NGN') {
+  const symbols = { NGN: '₦', USD: '$', GHS: '₵', KES: 'KSh' };
+  const sym = symbols[currency] || (currency + ' ');
+  return `${sym}${Number(amount).toLocaleString('en-NG', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+}
+
+// ─── PHARMACY FUZZY PRODUCT MATCH ────────────────────
+function fuzzyMatchProducts(query, products) {
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+  const q = norm(query);
+  const qWords = q.split(/\s+/).filter(w => w.length > 2);
+  return products
+    .map(p => {
+      const n = norm(p.name);
+      let score = 0;
+      if (n === q) score = 100;
+      else if (n.includes(q) || q.includes(n)) score = 80;
+      else {
+        const nWords = n.split(/\s+/);
+        const hits = qWords.filter(w => nWords.some(nw => nw.startsWith(w) || w.startsWith(nw)));
+        score = qWords.length ? (hits.length / qWords.length) * 60 : 0;
+      }
+      return { ...p, _score: score };
+    })
+    .filter(p => p._score > 25)
+    .sort((a, b) => b._score - a._score);
+}
+
+// ─── PHARMACY AI BRAIN ────────────────────────────────
+async function pharmacyAI(message, history, collectedData, products, pharmacyConfig) {
+  const productList = products.length
+    ? products.map(p =>
+        `- ${p.name} (${p.rx_required ? 'Rx' : 'OTC'}, ${p.stock_qty > 0 ? 'in stock' : 'out of stock'})`
+      ).join('\n')
+    : 'No products currently available.';
+
+  const state = {
+    phase: collectedData.phase || 'product',
+    product_confirmed: collectedData.product_id ? collectedData.product_name : null,
+    qty_collected: collectedData.qty || null,
+    rx_required: collectedData.product_rx_required || false,
+    rx_confirmed: collectedData.rx_confirmed ?? null,
+    cart_count: (collectedData.cart || []).length,
+    fulfilment: collectedData.fulfilment || null,
+    area: collectedData.area || null,
+  };
+
+  const systemPrompt = `You are Zara, a pharmacy sales assistant for ${pharmacyConfig.pharmacy_name}.
+Your ONLY role is to help customers place product orders. You are not a pharmacist and you never give medical, dosage, or drug-interaction advice.
+
+PRODUCT CATALOGUE (these are the ONLY products that exist — never reference anything else):
+${productList}
+
+CURRENT ORDER STATE:
+${JSON.stringify(state)}
+
+YOUR JOB:
+Read the current order state. Ask for ONLY the next missing piece. One question at a time.
+
+PHASE GUIDE:
+- phase "product": if product_confirmed is null → find out what product the customer wants (extract product_name_mentioned). If product_confirmed is set but qty_collected is null → ask how many.
+- phase "rx_confirm": rx_required is true and rx_confirmed is null → ask the customer to confirm they have a valid prescription. Give no medical information whatsoever.
+- phase "more_or_checkout": cart has items → ask if they want to add more or checkout.
+- phase "delivery": if fulfilment is null → ask delivery or pickup. If DELIVERY and area is null → ask delivery area.
+- phase "confirm": order summary is shown by the server → detect yes/no only.
+
+TONE & HYGIENE:
+- Warm, brief, plain text. No emoji. No markdown bold in the reply field.
+- Vary acknowledgement phrases. Never repeat the same phrase twice.
+- Use the customer's name ONLY TWICE in the entire conversation: once when they first share it, once in the final confirmation.
+- Never ask for the customer's phone number.
+- If the customer asks about drug interactions, side effects, dosage, or whether a medicine is right for them: reply exactly "I can only help with placing your order. Please speak to a pharmacist or your doctor for medical questions."
+
+CRITICAL FINANCIAL RULE:
+Never state a price, subtotal, delivery fee, or total in your reply. The server handles all money display.
+
+INTENT VALUES: order | browse | track | cancel | collecting
+
+RESPOND ONLY WITH THIS JSON — no extra text:
+{
+  "reply": "...",
+  "extracted": {
+    "product_name_mentioned": null,
+    "qty": null,
+    "fulfilment": null,
+    "area": null,
+    "rx_confirmed": null
+  },
+  "intent": "collecting"
+}
+
+Only populate extracted fields you actually observed in the customer's message.`;
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.map(h => ({ role: h.role === 'assistant' ? 'assistant' : 'user', content: h.content }))
+  ];
+
+  let rawText = '';
+  try {
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages,
+      temperature: 0.3,
+      max_tokens: 400,
+      response_format: { type: 'json_object' }
+    });
+    rawText = completion.choices[0].message.content;
+    rawText = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+    const parsed = JSON.parse(rawText);
+    if (typeof parsed !== 'object' || parsed === null) throw new Error('Invalid JSON shape');
+    return parsed;
+  } catch (e) {
+    addLog('error', 'Groq pharmacyAI parse/call error', `${e.message} | raw: ${rawText.slice(0, 200)}`);
+    return {
+      reply: "Could you say that again? I want to make sure I get your order right.",
+      extracted: {},
+      intent: 'collecting'
+    };
+  }
+}
+
+// ─── ORDER SUMMARY (server-computed, no LLM) ──────────
+function buildOrderSummary(data, pharmacyConfig) {
+  const currency = pharmacyConfig.currency || 'NGN';
+  const fee = data.fulfilment === 'DELIVERY' ? (parseFloat(pharmacyConfig.delivery_fee) || 0) : 0;
+  const subtotal = data.cart.reduce((s, i) => s + i.price_snap * i.qty, 0);
+  const total = subtotal + fee;
+  const lines = data.cart.map(i => `${i.name_snap} x${i.qty} — ${formatCurrency(i.price_snap * i.qty, currency)}`);
+  let msg = `Order Summary\n\n${lines.join('\n')}\n\nSubtotal: ${formatCurrency(subtotal, currency)}\n`;
+  if (data.fulfilment === 'DELIVERY') {
+    msg += `Delivery to ${data.area}: ${formatCurrency(fee, currency)}\n`;
+  } else {
+    msg += `Fulfilment: Pickup\n`;
+  }
+  msg += `Total: ${formatCurrency(total, currency)}\n\nReply YES to confirm or NO to cancel.`;
+  return msg;
+}
+
+// ─── ADD PRODUCT TO CART AND PROMPT ───────────────────
+async function addToCartAndPrompt(data, history, phone, pharmacyConfig, now) {
+  const currency = pharmacyConfig.currency || 'NGN';
+  data.cart.push({
+    product_id: data.product_id,
+    name_snap: data.product_name,
+    price_snap: data.product_price,
+    qty: data.qty,
+    rx_required: data.product_rx_required
+  });
+  data.product_id = null;
+  data.product_name = null;
+  data.product_price = null;
+  data.product_rx_required = false;
+  data.rx_confirmed = null;
+  data.qty = null;
+  data.phase = 'more_or_checkout';
+
+  const cartLines = data.cart.map(i => `${i.name_snap} x${i.qty} — ${formatCurrency(i.price_snap * i.qty, currency)}`);
+  const subtotal = data.cart.reduce((s, i) => s + i.price_snap * i.qty, 0);
+  const reply = `Added to your cart.\n\nCart:\n${cartLines.join('\n')}\nSubtotal: ${formatCurrency(subtotal, currency)}\n\nWould you like to add another item, or type checkout to proceed?`;
+  history.push({ role: 'assistant', content: reply, timestamp: now });
+  data.history = history.slice(-20);
+  await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+  return reply;
+}
+
+// ─── PAYMENT HELPERS ──────────────────────────────────
+
+function verifyPaystackSignature(rawBody, signatureHeader, secret) {
+  const hash = crypto
+    .createHmac('sha512', secret)
+    .update(rawBody)
+    .digest('hex');
+  return hash === signatureHeader;
+}
+
+async function initializePaystackPayment(orderId, totalNaira, customerPhone, reference, pharmacyConfig) {
+  const amountKobo = Math.round(totalNaira * 100);
+  const response = await axios.post(
+    'https://api.paystack.co/transaction/initialize',
+    {
+      amount: amountKobo,
+      reference,
+      // email is required by Paystack; derive a placeholder from phone
+      email: `${customerPhone.replace(/[^0-9]/g, '')}@whatsapp.pharmacy`,
+      metadata: { order_id: orderId, pharmacy_id: pharmacyConfig.id, customer_phone: customerPhone }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${pharmacyConfig.paystack_secret_key}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+  // returns { reference, authorization_url, access_code }
+  return response.data.data;
+}
+
+// Atomically marks an order PAID and decrements stock.
+// Returns the updated order row, or null if already paid / not found.
+async function confirmOrderPayment(orderId, paymentRef, pharmacyId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const orderRes = await client.query(
+      `UPDATE orders SET status = 'PAID', payment_ref = $1, paid_at = NOW()
+       WHERE id = $2 AND pharmacy_id = $3 AND status != 'PAID'
+       RETURNING *`,
+      [paymentRef, orderId, pharmacyId]
+    );
+    if (orderRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return null; // already paid or not found
+    }
+    const order = orderRes.rows[0];
+
+    const items = await client.query(
+      'SELECT * FROM order_items WHERE order_id = $1',
+      [orderId]
+    );
+    for (const item of items.rows) {
+      await client.query(
+        `UPDATE products SET stock_qty = GREATEST(stock_qty - $1, 0) WHERE id = $2`,
+        [item.qty, item.product_id]
+      );
+      await client.query(
+        `INSERT INTO inventory_log (product_id, change, reason, order_id) VALUES ($1, $2, 'SALE', $3)`,
+        [item.product_id, -item.qty, orderId]
+      );
+    }
+
+    await client.query('COMMIT');
+    return order;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function notifyCustomerPaymentConfirmed(order, pharmacy) {
+  const currency = pharmacy.currency || 'NGN';
+  const ref = `ZPHARM-${order.id}`;
+  let msg = `Payment received. Thank you!\n\nOrder ${ref}\nTotal: ${formatCurrency(order.total, currency)}\n\n`;
+  if (order.fulfilment === 'DELIVERY') {
+    const area = order.delivery_area ? ` to ${order.delivery_area}` : '';
+    msg += `Your order is being prepared for delivery${area}.`;
+    if (pharmacy.delivery_note) msg += `\n${pharmacy.delivery_note}`;
+  } else {
+    msg += `Your order is being prepared. We will let you know when it is ready for collection.`;
+  }
+  await sendWhatsApp(order.customer_phone, msg, pharmacy.phone_number_id);
+}
+
+// ─── PHARMACY MESSAGE PROCESSOR ───────────────────────
+async function processPharmacyMessage(phone, message, pharmacyConfig) {
+  const conv = await getPharmacyConversation(phone, pharmacyConfig.id);
+  const msg = message.trim().toLowerCase();
+  const now = new Date().toISOString();
+
+  let data = conv.data || {};
+  data.pharmacy_id = pharmacyConfig.id;
+  if (!data.cart) data.cart = [];
+
+  let history = data.history || [];
+  const currency = pharmacyConfig.currency || 'NGN';
+  const deliveryFee = parseFloat(pharmacyConfig.delivery_fee) || 0;
+
+  // ── GLOBAL RESETS ──
+  if (['restart', 'reset', 'start over'].includes(msg)) {
+    await updatePharmacyConversation(phone, pharmacyConfig.id, 'START', {});
+    return `Session restarted. Send a message to begin.`;
+  }
+
+  // ── START ──
+  if (conv.state === 'START') {
+    const greeting = getGreeting();
+    const welcome = `${greeting}. Welcome to *${pharmacyConfig.pharmacy_name}*.\n\nI'm Zara, your pharmacy assistant. Tell me what you need — I can help you order products, check what's in stock, or track a previous order.`;
+    history = [{ role: 'assistant', content: welcome, timestamp: now }];
+    data.history = history;
+    await updatePharmacyConversation(phone, pharmacyConfig.id, 'MENU', data);
+    return welcome;
+  }
+
+  // ── DONE — customer returns ──
+  if (conv.state === 'DONE') {
+    const welcome = `Welcome back to *${pharmacyConfig.pharmacy_name}*. What can I help you with?`;
+    history = [{ role: 'assistant', content: welcome, timestamp: now }];
+    data = { pharmacy_id: pharmacyConfig.id, cart: [], history };
+    await updatePharmacyConversation(phone, pharmacyConfig.id, 'MENU', data);
+    return welcome;
+  }
+
+  // ── MENU — detect intent, move to ACTIVE ──
+  if (conv.state === 'MENU') {
+    history.push({ role: 'user', content: message, timestamp: now });
+
+    if (msg.includes('track') || msg.includes('my order') || msg.includes('order status')) {
+      const orders = await pool.query(
+        `SELECT id, status, total, created_at FROM orders WHERE customer_phone = $1 AND pharmacy_id = $2 ORDER BY created_at DESC LIMIT 5`,
+        [phone, pharmacyConfig.id]
+      );
+      let reply;
+      if (orders.rows.length === 0) {
+        reply = `You have no orders with us yet. Tell me what product you need and I will help you place one.`;
+      } else {
+        const lines = orders.rows.map(o => `ORD-${String(o.id).padStart(5, '0')} — ${o.status} — ${formatCurrency(o.total, currency)}`);
+        reply = `Your recent orders:\n\n${lines.join('\n')}\n\nIs there anything else I can help you with?`;
+      }
+      history.push({ role: 'assistant', content: reply, timestamp: now });
+      data.history = history.slice(-20);
+      await updatePharmacyConversation(phone, pharmacyConfig.id, 'MENU', data);
+      return reply;
+    }
+
+    // Any other message — move to ACTIVE and handle as product inquiry
+    data.phase = 'product';
+    data.product_id = null;
+    data.product_name = null;
+    data.product_price = null;
+    data.product_rx_required = false;
+    data.rx_confirmed = null;
+    data.qty = null;
+    data.history = history.slice(-20);
+    await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+    conv.state = 'ACTIVE'; // fall through below
+  }
+
+  // ── ACTIVE — full AI-driven order collection ──
+  if (conv.state === 'ACTIVE') {
+    // Avoid duplicating user message if MENU already pushed it
+    const last = history[history.length - 1];
+    if (!last || last.role !== 'user' || last.content !== message) {
+      history.push({ role: 'user', content: message, timestamp: now });
+    }
+
+    const phase = data.phase || 'product';
+
+    // ── PHASE: CONFIRM ──
+    if (phase === 'confirm') {
+      if (['yes', 'y', 'confirm', 'ok', 'sure'].includes(msg)) {
+        const subtotal = data.cart.reduce((s, i) => s + i.price_snap * i.qty, 0);
+        const fee = data.fulfilment === 'DELIVERY' ? deliveryFee : 0;
+        const total = subtotal + fee; // all math in server code, never LLM
+
+        const orderResult = await pool.query(
+          `INSERT INTO orders (pharmacy_id, customer_phone, customer_name, status, fulfilment, subtotal, delivery_fee, total, conversation_id, delivery_area)
+           VALUES ($1, $2, $3, 'PENDING', $4, $5, $6, $7, $8, $9) RETURNING id`,
+          [pharmacyConfig.id, phone, data.customer_name || null, data.fulfilment, subtotal, fee, total, phone, data.area || null]
+        );
+        const orderId = orderResult.rows[0].id;
+
+        // Insert order line items — inventory only decrements on confirmed payment, never here
+        for (const item of data.cart) {
+          await pool.query(
+            `INSERT INTO order_items (order_id, product_id, name_snap, price_snap, qty) VALUES ($1, $2, $3, $4, $5)`,
+            [orderId, item.product_id, item.name_snap, item.price_snap, item.qty]
+          );
+        }
+
+        const needsRxReview = data.cart.some(i => i.rx_required);
+        if (needsRxReview) {
+          await pool.query(`UPDATE orders SET status = 'PENDING_RX_REVIEW' WHERE id = $1`, [orderId]);
+        }
+
+        const orderRef = `ZPHARM-${orderId}`;
+        let confirmMsg;
+
+        if (!needsRxReview && pharmacyConfig.payment_provider === 'paystack' && pharmacyConfig.paystack_secret_key) {
+          try {
+            const payment = await initializePaystackPayment(orderId, total, phone, orderRef, pharmacyConfig);
+            await pool.query(
+              `UPDATE orders SET payment_ref = $1, payment_link = $2 WHERE id = $3`,
+              [payment.reference, payment.authorization_url, orderId]
+            );
+            confirmMsg = `Your order is confirmed.\n\nReference: ${orderRef}\nTotal: ${formatCurrency(total, currency)}\n\nComplete your payment here:\n${payment.authorization_url}\n\nYour order will be processed as soon as payment is received. Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
+          } catch (e) {
+            addLog('error', 'Paystack init failed', e.message);
+            confirmMsg = `Your order is confirmed.\n\nReference: ${orderRef}\nTotal: ${formatCurrency(total, currency)}\n\nOur team will contact you with payment details shortly. Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
+          }
+        } else if (!needsRxReview && pharmacyConfig.payment_provider === 'manual' && pharmacyConfig.manual_payment_details) {
+          confirmMsg = `Your order is confirmed.\n\nReference: ${orderRef}\nTotal: ${formatCurrency(total, currency)}\n\nPlease pay via:\n${pharmacyConfig.manual_payment_details}\n\nUse reference ${orderRef} when making your transfer. Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
+        } else {
+          const rxNote = needsRxReview
+            ? `One or more items require a valid prescription. Our team will verify before processing.\n\n`
+            : '';
+          confirmMsg = `Your order is confirmed.\n\n${rxNote}Reference: ${orderRef}\nTotal: ${formatCurrency(total, currency)}\n\nOur team will be in touch with next steps. Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
+        }
+
+        history.push({ role: 'assistant', content: confirmMsg, timestamp: now });
+        data.cart = [];
+        data.phase = null;
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'DONE', { ...data, history: history.slice(-50) });
+        io.emit('queue_updated', { type: 'pharmacy_order', orderId, pharmacyId: pharmacyConfig.id, needsRxReview });
+        addLog('info', `Pharmacy order: ${orderRef} | ${pharmacyConfig.pharmacy_name} | ${formatCurrency(total, currency)}`);
+        return confirmMsg;
+      }
+
+      if (['no', 'n', 'cancel'].includes(msg)) {
+        data.phase = 'more_or_checkout';
+        const reply = data.cart.length
+          ? `Order cancelled. Your cart still has ${data.cart.length} item(s). Type checkout to try again or clear to empty your cart.`
+          : `Order cancelled. Tell me what you need.`;
+        history.push({ role: 'assistant', content: reply, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return reply;
+      }
+
+      const summary = buildOrderSummary(data, pharmacyConfig);
+      history.push({ role: 'assistant', content: summary, timestamp: now });
+      data.history = history.slice(-20);
+      await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+      return summary;
+    }
+
+    // ── PHASE: DELIVERY ──
+    if (phase === 'delivery') {
+      if (!data.fulfilment) {
+        let resolved = null;
+        if (msg === '1' || msg.includes('deliver')) resolved = 'DELIVERY';
+        else if (msg === '2' || msg.includes('pickup') || msg.includes('pick up') || msg.includes('collect')) resolved = 'PICKUP';
+
+        if (!resolved) {
+          const allP = await pool.query(
+            `SELECT id, name, price, stock_qty, rx_required FROM products WHERE pharmacy_id = $1 AND active = true ORDER BY name ASC`,
+            [pharmacyConfig.id]
+          );
+          const aiResp = await pharmacyAI(message, history.slice(-20), data, allP.rows, pharmacyConfig);
+          if (aiResp.extracted?.fulfilment) {
+            resolved = aiResp.extracted.fulfilment.toUpperCase();
+          } else {
+            const reply = aiResp.reply || `How would you like to receive your order? Reply 1 for Delivery or 2 for Pickup.`;
+            history.push({ role: 'assistant', content: reply, timestamp: now });
+            data.history = history.slice(-20);
+            await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+            return reply;
+          }
+        }
+
+        data.fulfilment = resolved;
+        if (resolved === 'PICKUP') {
+          data.phase = 'confirm';
+          const summary = buildOrderSummary(data, pharmacyConfig);
+          history.push({ role: 'assistant', content: summary, timestamp: now });
+          data.history = history.slice(-20);
+          await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+          return summary;
+        }
+        const areaQ = `What area should we deliver to?`;
+        history.push({ role: 'assistant', content: areaQ, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return areaQ;
+      }
+
+      if (data.fulfilment === 'DELIVERY' && !data.area) {
+        data.area = message.trim();
+        data.phase = 'confirm';
+        const summary = buildOrderSummary(data, pharmacyConfig);
+        history.push({ role: 'assistant', content: summary, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return summary;
+      }
+    }
+
+    // ── PHASE: MORE_OR_CHECKOUT ──
+    if (phase === 'more_or_checkout') {
+      if (msg === 'clear' || msg === 'clear cart') {
+        data.cart = [];
+        data.phase = 'product';
+        const reply = `Cart cleared. What would you like to order?`;
+        history.push({ role: 'assistant', content: reply, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return reply;
+      }
+      if (['checkout', 'done', 'proceed', "that's all", "that's it", 'no more', 'nothing else'].includes(msg)) {
+        data.phase = 'delivery';
+        data.fulfilment = null;
+        data.area = null;
+        const delivQ = `How would you like to receive your order?\n\n1. Delivery\n2. Pickup`;
+        history.push({ role: 'assistant', content: delivQ, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return delivQ;
+      }
+    }
+
+    // ── PHASE: PRODUCT — server-side qty shortcut ──
+    if (phase === 'product' && data.product_id && !data.qty) {
+      const n = parseInt(msg);
+      if (!isNaN(n) && n >= 1 && n <= 99) {
+        const stock = await pool.query('SELECT stock_qty FROM products WHERE id = $1', [data.product_id]);
+        const avail = stock.rows[0]?.stock_qty ?? 0;
+        if (n > avail) {
+          const reply = `We only have ${avail} unit(s) of ${data.product_name} available. How many would you like?`;
+          history.push({ role: 'assistant', content: reply, timestamp: now });
+          data.history = history.slice(-20);
+          await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+          return reply;
+        }
+        data.qty = n;
+        if (data.product_rx_required && data.rx_confirmed === null) {
+          data.phase = 'rx_confirm';
+          const rxQ = `${data.product_name} requires a valid prescription.\n\nPlease confirm you have a current valid prescription for this item before we continue. Reply yes or no.`;
+          history.push({ role: 'assistant', content: rxQ, timestamp: now });
+          data.history = history.slice(-20);
+          await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+          return rxQ;
+        }
+        return await addToCartAndPrompt(data, history, phone, pharmacyConfig, now);
+      }
+    }
+
+    // ── PHASE: RX_CONFIRM ──
+    if (phase === 'rx_confirm') {
+      const hasRx = ['yes', 'y', 'i have', 'i do', 'have it'].includes(msg) ||
+        msg.includes('have a prescription') || msg.includes('have the prescription');
+      const noRx = ['no', 'n'].includes(msg) ||
+        msg.includes("don't have") || msg.includes("dont have") || msg.includes("i don't");
+
+      if (hasRx) {
+        data.rx_confirmed = true;
+        data.phase = 'product';
+        return await addToCartAndPrompt(data, history, phone, pharmacyConfig, now);
+      }
+      if (noRx) {
+        data.product_id = null; data.product_name = null; data.product_price = null;
+        data.product_rx_required = false; data.qty = null; data.rx_confirmed = null;
+        data.phase = data.cart.length > 0 ? 'more_or_checkout' : 'product';
+        const reply = data.cart.length > 0
+          ? `No problem. Your cart has ${data.cart.length} item(s). Type checkout to proceed, or tell me what else you need.`
+          : `No problem. What else can I help you find?`;
+        history.push({ role: 'assistant', content: reply, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return reply;
+      }
+      const rxRemind = `Do you have a valid prescription for ${data.product_name}? Reply yes or no.`;
+      history.push({ role: 'assistant', content: rxRemind, timestamp: now });
+      data.history = history.slice(-20);
+      await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+      return rxRemind;
+    }
+
+    // ── PHARMACY AI CALL ──
+    const allProducts = await pool.query(
+      `SELECT id, name, price, stock_qty, rx_required FROM products WHERE pharmacy_id = $1 AND active = true ORDER BY name ASC`,
+      [pharmacyConfig.id]
+    );
+    const aiResp = await pharmacyAI(message, history.slice(-20), data, allProducts.rows, pharmacyConfig);
+
+    // ── PRODUCT NAME EXTRACTION → server fuzzy match ──
+    if (aiResp.extracted?.product_name_mentioned && !data.product_id) {
+      const inStock = allProducts.rows.filter(p => p.stock_qty > 0);
+      const matched = fuzzyMatchProducts(aiResp.extracted.product_name_mentioned, inStock);
+
+      if (matched.length === 0) {
+        const alts = allProducts.rows.filter(p => p.stock_qty > 0).slice(0, 6);
+        let reply;
+        if (alts.length === 0) {
+          reply = `Sorry, we don't currently have that or any in-stock alternatives. Please check back soon.`;
+        } else {
+          const altList = alts.map(p => `${p.name} — ${formatCurrency(p.price, currency)}`).join('\n');
+          reply = `Sorry, we don't have "${aiResp.extracted.product_name_mentioned}" in stock.\n\nHere is what we currently have:\n\n${altList}\n\nWould you like any of these?`;
+        }
+        history.push({ role: 'assistant', content: reply, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return reply;
+      }
+
+      const best = matched[0];
+      // price and rx_required come from DB — never from the LLM
+      data.product_id = best.id;
+      data.product_name = best.name;
+      data.product_price = parseFloat(best.price);
+      data.product_rx_required = best.rx_required || false;
+      data.phase = 'product';
+
+      const confirmReply = `We have ${best.name} — ${formatCurrency(best.price, currency)} each.\n\nHow many would you like?`;
+      history.push({ role: 'assistant', content: confirmReply, timestamp: now });
+      data.history = history.slice(-20);
+      await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+      return confirmReply;
+    }
+
+    // ── QTY EXTRACTION from AI ──
+    if (aiResp.extracted?.qty && data.product_id && !data.qty) {
+      const n = parseInt(aiResp.extracted.qty);
+      if (!isNaN(n) && n >= 1 && n <= 99) {
+        const stock = await pool.query('SELECT stock_qty FROM products WHERE id = $1', [data.product_id]);
+        const avail = stock.rows[0]?.stock_qty ?? 0;
+        if (n > avail) {
+          const reply = `We only have ${avail} unit(s) of ${data.product_name} available. How many would you like?`;
+          history.push({ role: 'assistant', content: reply, timestamp: now });
+          data.history = history.slice(-20);
+          await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+          return reply;
+        }
+        data.qty = n;
+        if (data.product_rx_required && data.rx_confirmed === null) {
+          data.phase = 'rx_confirm';
+          const rxQ = `${data.product_name} requires a valid prescription.\n\nPlease confirm you have a current valid prescription before we continue. Reply yes or no.`;
+          history.push({ role: 'assistant', content: rxQ, timestamp: now });
+          data.history = history.slice(-20);
+          await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+          return rxQ;
+        }
+        return await addToCartAndPrompt(data, history, phone, pharmacyConfig, now);
+      }
+    }
+
+    // ── NEW PRODUCT NAMED WHILE IN more_or_checkout ──
+    if (aiResp.extracted?.product_name_mentioned && phase === 'more_or_checkout') {
+      data.phase = 'product';
+      data.product_id = null; data.product_name = null; data.product_price = null;
+      data.product_rx_required = false; data.rx_confirmed = null; data.qty = null;
+      const inStock = allProducts.rows.filter(p => p.stock_qty > 0);
+      const matched = fuzzyMatchProducts(aiResp.extracted.product_name_mentioned, inStock);
+      if (matched.length > 0) {
+        const best = matched[0];
+        data.product_id = best.id;
+        data.product_name = best.name;
+        data.product_price = parseFloat(best.price);
+        data.product_rx_required = best.rx_required || false;
+        const confirmReply = `We have ${best.name} — ${formatCurrency(best.price, currency)} each.\n\nHow many would you like?`;
+        history.push({ role: 'assistant', content: confirmReply, timestamp: now });
+        data.history = history.slice(-20);
+        await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+        return confirmReply;
+      }
+    }
+
+    // ── FALLBACK: use AI reply ──
+    const fallback = aiResp.reply || `What product are you looking for? I can help you find it.`;
+    history.push({ role: 'assistant', content: fallback, timestamp: now });
+    data.history = history.slice(-20);
+    await updatePharmacyConversation(phone, pharmacyConfig.id, 'ACTIVE', data);
+    return fallback;
+  }
+
+  return `Welcome to ${pharmacyConfig.pharmacy_name}. Send a message to get started.`;
+}
+
 // ─── META WEBHOOK VERIFICATION ────────────────────────
 app.get('/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -758,15 +1486,25 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     const msg = value.messages[0];
     const phone = msg.from;
-    const message = msg.text?.body;
-    if (!phone || !message) return;
+
+    // Extract text or media attachment (images/PDFs — used for prescription uploads)
+    const message         = msg.text?.body || null;
+    const mediaId         = msg.image?.id       || msg.document?.id       || null;
+    const mediaMime       = msg.image?.mime_type || msg.document?.mime_type || null;
+    const mediaFilename   = msg.document?.filename || (msg.image ? `prescription_${Date.now()}.jpg` : null);
+    const mediaAttachment = mediaId ? { mediaId, mediaMime, mediaFilename } : null;
+
+    // Need at least a text body or a media attachment
+    if (!phone || (!message && !mediaAttachment)) return;
 
     if (!msg.id || isAlreadyProcessed(msg.id)) {
       addLog('info', 'Duplicate webhook ignored', msg.id);
       return;
     }
 
-    addLog('info', `Message from ${phone}: ${message}`);
+    const incomingPhoneNumberId = value.metadata?.phone_number_id;
+    const tenant = await resolveTenant(incomingPhoneNumberId);
+    addLog('info', `Message from ${phone} [${tenant.business_type}]: ${message || '(media)'}`);
 
     io.emit('new_message', {
       conversationId: phone,
@@ -774,15 +1512,28 @@ app.post('/webhook/whatsapp', async (req, res) => {
         id: msg.id,
         conversation_id: phone,
         sender: 'PATIENT',
-        body: message,
-        type: 'text',
+        body: message || '(media attachment)',
+        type: mediaAttachment ? 'media' : 'text',
         status: 'delivered',
         timestamp: new Date().toISOString()
       }
     });
 
-    const reply = await processMessage(phone, message);
-    await sendWhatsApp(phone, reply);
+    // Kill switch: pharmacy exists but active = false — drop silently
+    if (tenant.business_type === 'PHARMACY_INACTIVE') {
+      addLog('info', `[INACTIVE] ${tenant.config.pharmacy_name} — message from ${phone} dropped`);
+      return;
+    }
+
+    let reply;
+    if (tenant.business_type === 'PHARMACY') {
+      const adapter = loadAdapter(tenant.config, pool);
+      reply = await pharmFlow.processPharmacyMessage(phone, message, mediaAttachment, tenant.config, adapter);
+      if (reply) await sendWhatsApp(phone, reply, tenant.config.phone_number_id);
+    } else {
+      reply = await processMessage(phone, message);
+      await sendWhatsApp(phone, reply);
+    }
 
     io.emit('new_message', {
       conversationId: phone,
@@ -815,6 +1566,62 @@ app.post('/webhook/twilio', async (req, res) => {
     addLog('error', 'Twilio webhook error', error.message);
     res.set('Content-Type', 'text/xml');
     res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>Sorry, something went wrong. Please try again.</Message></Response>`);
+  }
+});
+
+// ─── PAYSTACK PAYMENT WEBHOOK ─────────────────────────
+// NOTE: req.rawBody is captured by the express.json verify callback at the top.
+// We look up the tenant by payment_ref so each pharmacy's own secret is used.
+app.post('/webhook/payment', async (req, res) => {
+  // Acknowledge immediately; Paystack retries if it doesn't get 200 fast
+  res.sendStatus(200);
+  try {
+    const signature = req.headers['x-paystack-signature'];
+    if (!signature) return;
+
+    const payload = req.body;
+    if (!payload || payload.event !== 'charge.success') return;
+
+    const reference = payload.data?.reference;
+    if (!reference) return;
+
+    // Resolve the tenant from the order so we use their secret for verification
+    const orderRes = await pool.query(
+      `SELECT o.id, o.pharmacy_id, o.status,
+              p.paystack_secret_key, p.phone_number_id, p.pharmacy_name,
+              p.currency, p.delivery_note
+       FROM orders o
+       JOIN pharmacy_config p ON p.id = o.pharmacy_id
+       WHERE o.payment_ref = $1
+       LIMIT 1`,
+      [reference]
+    );
+    if (orderRes.rows.length === 0) {
+      addLog('warn', 'Paystack webhook: unknown reference', reference);
+      return;
+    }
+    const row = orderRes.rows[0];
+
+    if (!row.paystack_secret_key) {
+      addLog('warn', 'Paystack webhook: no secret configured for pharmacy', row.pharmacy_id);
+      return;
+    }
+
+    if (!verifyPaystackSignature(req.rawBody, signature, row.paystack_secret_key)) {
+      addLog('warn', 'Paystack webhook: signature mismatch', reference);
+      return;
+    }
+
+    if (row.status === 'PAID') return; // idempotent
+
+    const confirmedOrder = await confirmOrderPayment(row.id, reference, row.pharmacy_id);
+    if (!confirmedOrder) return; // concurrent request already confirmed it
+
+    await notifyCustomerPaymentConfirmed(confirmedOrder, row);
+    io.emit('queue_updated', { type: 'pharmacy_order_paid', orderId: confirmedOrder.id, pharmacyId: confirmedOrder.pharmacy_id });
+    addLog('info', `Paystack payment confirmed: ZPHARM-${confirmedOrder.id} | ${row.pharmacy_name}`);
+  } catch (e) {
+    addLog('error', 'Paystack webhook error', e.message);
   }
 });
 
@@ -1307,6 +2114,194 @@ app.get('/api/metrics/zero-performance', adminAuth, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── PHARMACY: MANUAL PAYMENT CONFIRM ─────────────────
+// Dashboard action for manual-provider pharmacies. Runs the same
+// confirmOrderPayment transaction as the Paystack webhook.
+app.post('/api/pharmacy/orders/:orderId/confirm-payment', async (req, res) => {
+  const orderId = parseInt(req.params.orderId, 10);
+  if (isNaN(orderId)) return res.status(400).json({ error: 'Invalid order ID' });
+
+  try {
+    const orderRes = await pool.query(
+      `SELECT o.*, p.phone_number_id, p.pharmacy_name, p.currency, p.delivery_note
+       FROM orders o
+       JOIN pharmacy_config p ON p.id = o.pharmacy_id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+    if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+    const row = orderRes.rows[0];
+
+    if (row.status === 'PAID') return res.status(409).json({ error: 'Order already paid' });
+
+    const paymentRef = req.body?.payment_ref || `MANUAL-${orderId}-${Date.now()}`;
+    const confirmedOrder = await confirmOrderPayment(orderId, paymentRef, row.pharmacy_id);
+    if (!confirmedOrder) return res.status(409).json({ error: 'Order already paid or not found' });
+
+    await notifyCustomerPaymentConfirmed(confirmedOrder, row);
+    io.emit('queue_updated', { type: 'pharmacy_order_paid', orderId: confirmedOrder.id, pharmacyId: confirmedOrder.pharmacy_id });
+    addLog('info', `Manual payment confirmed: ZPHARM-${orderId} | ${row.pharmacy_name}`);
+    res.json({ success: true, order: confirmedOrder });
+  } catch (e) {
+    addLog('error', 'Manual payment confirm error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── PHARMACY ORDERS API ──────────────────────────────
+
+const ORDER_ITEMS_AGG = `
+  COALESCE(
+    json_agg(
+      json_build_object(
+        'id', oi.id, 'product_id', oi.product_id,
+        'name_snap', oi.name_snap, 'price_snap', oi.price_snap::float, 'qty', oi.qty
+      ) ORDER BY oi.id
+    ) FILTER (WHERE oi.id IS NOT NULL),
+    '[]'
+  ) AS items`;
+
+app.get('/api/pharmacy/:pharmacyId/orders', async (req, res) => {
+  try {
+    const { pharmacyId } = req.params;
+    const result = await pool.query(
+      `SELECT o.*, ${ORDER_ITEMS_AGG}
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.pharmacy_id = $1 AND o.status != 'CANCELLED'
+       GROUP BY o.id
+       ORDER BY o.created_at DESC`,
+      [pharmacyId]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/pharmacy/orders/:orderId/status', async (req, res) => {
+  const orderId = parseInt(req.params.orderId, 10);
+  const { status } = req.body;
+  const VALID = ['FULFILLING', 'DISPATCHED', 'DONE', 'CANCELLED'];
+  if (!VALID.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+
+  try {
+    const orderRes = await pool.query(
+      `SELECT o.*, p.phone_number_id, p.pharmacy_name, p.currency, p.delivery_note
+       FROM orders o JOIN pharmacy_config p ON p.id = o.pharmacy_id
+       WHERE o.id = $1`,
+      [orderId]
+    );
+    if (!orderRes.rows.length) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+    if (order.status === status) return res.json({ order }); // idempotent
+
+    if (status === 'CANCELLED') {
+      // Restore inventory only if stock was already decremented (PAID or beyond)
+      const paidStatuses = ['PAID', 'FULFILLING', 'DISPATCHED'];
+      if (paidStatuses.includes(order.status)) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(`UPDATE orders SET status = 'CANCELLED' WHERE id = $1`, [orderId]);
+          const items = await client.query('SELECT * FROM order_items WHERE order_id = $1', [orderId]);
+          for (const item of items.rows) {
+            await client.query(
+              `UPDATE products SET stock_qty = stock_qty + $1 WHERE id = $2`,
+              [item.qty, item.product_id]
+            );
+            await client.query(
+              `INSERT INTO inventory_log (product_id, change, reason, order_id) VALUES ($1, $2, 'RETURN', $3)`,
+              [item.product_id, item.qty, orderId]
+            );
+          }
+          await client.query('COMMIT');
+        } catch (e) {
+          await client.query('ROLLBACK'); throw e;
+        } finally { client.release(); }
+      } else {
+        await pool.query(`UPDATE orders SET status = 'CANCELLED' WHERE id = $1`, [orderId]);
+      }
+    } else {
+      await pool.query(`UPDATE orders SET status = $1 WHERE id = $2`, [status, orderId]);
+    }
+
+    const updated = await pool.query(
+      `SELECT o.*, ${ORDER_ITEMS_AGG}
+       FROM orders o LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.id = $1 GROUP BY o.id`,
+      [orderId]
+    );
+    io.emit('queue_updated', {
+      type: 'pharmacy_order_status',
+      orderId,
+      status,
+      pharmacyId: order.pharmacy_id
+    });
+    addLog('info', `Order ${orderId} → ${status}`);
+    res.json({ order: updated.rows[0] });
+  } catch (e) {
+    addLog('error', 'Order status update error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── PHARMACY INVENTORY API ───────────────────────────
+
+app.get('/api/pharmacy/:pharmacyId/products', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM products WHERE pharmacy_id = $1 ORDER BY name ASC`,
+      [req.params.pharmacyId]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/pharmacy/products/:productId', async (req, res) => {
+  const { productId } = req.params;
+  const { price, active } = req.body;
+  const sets = []; const vals = [];
+  if (price !== undefined) { sets.push(`price = $${vals.length + 1}`); vals.push(price); }
+  if (active !== undefined) { sets.push(`active = $${vals.length + 1}`); vals.push(active); }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+  vals.push(productId);
+  try {
+    const result = await pool.query(
+      `UPDATE products SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`,
+      vals
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Product not found' });
+    res.json({ product: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/pharmacy/products/:productId/stock', async (req, res) => {
+  const { productId } = req.params;
+  const { change, reason } = req.body;
+  if (typeof change !== 'number' || !['RESTOCK', 'ADJUST'].includes(reason)) {
+    return res.status(400).json({ error: 'change (number) and reason (RESTOCK|ADJUST) required' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE products SET stock_qty = GREATEST(stock_qty + $1, 0) WHERE id = $2 RETURNING *`,
+      [change, productId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Product not found' });
+    await pool.query(
+      `INSERT INTO inventory_log (product_id, change, reason) VALUES ($1, $2, $3)`,
+      [productId, change, reason]
+    );
+    res.json({ product: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
