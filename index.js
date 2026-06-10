@@ -1681,6 +1681,7 @@ app.post('/api/conversations/:id/reply', async (req, res) => {
     const { id } = req.params;
     const { body } = req.body;
     await sendWhatsApp(id, body);
+    const now = new Date().toISOString();
     const message = {
       id: `staff_${Date.now()}`,
       conversation_id: id,
@@ -1688,8 +1689,19 @@ app.post('/api/conversations/:id/reply', async (req, res) => {
       body,
       type: 'text',
       status: 'delivered',
-      timestamp: new Date().toISOString()
+      timestamp: now
     };
+    // Persist staff reply into conversation history
+    await pool.query(
+      `UPDATE conversations
+       SET data = jsonb_set(
+         COALESCE(data, '{}'),
+         '{history}',
+         COALESCE(data->'history', '[]') || $1::jsonb
+       ), updated_at = NOW()
+       WHERE phone = $2`,
+      [JSON.stringify([{ role: 'assistant', content: body, sender: 'HUMAN', timestamp: now }]), id]
+    );
     io.emit('new_message', { conversationId: id, message });
     res.json(message);
   } catch (error) {
