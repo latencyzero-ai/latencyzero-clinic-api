@@ -2556,6 +2556,174 @@ app.post('/api/web/handoff', async (req, res) => {
   }
 });
 
+// ─── HOSTED WIDGET SCRIPT ─────────────────────────────
+app.get('/widget/:widgetKey.js', async (req, res) => {
+  try {
+    const { widgetKey } = req.params;
+    const result = await pool.query(
+      'SELECT pharmacy_name FROM pharmacy_config WHERE widget_key = $1 AND active = true LIMIT 1',
+      [widgetKey]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).type('application/javascript').send('/* Zero: widget key not found */');
+    }
+    const pharmacyName = result.rows[0].pharmacy_name;
+    const apiUrl = (process.env.RENDER_EXTERNAL_URL || `https://latencyzero-clinic-api.onrender.com`).replace(/\/$/, '');
+
+    const script = `(function(){
+  var API    = ${JSON.stringify(apiUrl)};
+  var KEY    = ${JSON.stringify(widgetKey)};
+  var NAME   = ${JSON.stringify(pharmacyName)};
+  var SK     = 'zp_sid_' + KEY;
+  var sid    = sessionStorage.getItem(SK) || null;
+  var open   = false;
+
+  var css = \`
+    #_zw{position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:system-ui,-apple-system,sans-serif;font-size:14px}
+    #_zw *{box-sizing:border-box;margin:0;padding:0}
+    #_zw-btn{width:56px;height:56px;border-radius:50%;background:#0d7fe8;border:none;cursor:pointer;
+      box-shadow:0 4px 20px rgba(13,127,232,.4);display:flex;align-items:center;justify-content:center;
+      margin-left:auto;transition:transform .2s}
+    #_zw-btn:hover{transform:scale(1.08)}
+    #_zw-btn svg{width:24px;height:24px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    #_zw-box{width:360px;height:520px;background:#fff;border-radius:16px;
+      box-shadow:0 8px 40px rgba(0,0,0,.18);display:flex;flex-direction:column;
+      margin-bottom:12px;overflow:hidden;transition:opacity .2s,transform .2s}
+    #_zw-box.hide{opacity:0;transform:translateY(12px);pointer-events:none}
+    #_zw-head{background:#0d7fe8;color:#fff;padding:14px 16px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+    #_zw-head-avatar{width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.25);
+      display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0}
+    #_zw-head-info{flex:1;min-width:0}
+    #_zw-head-name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #_zw-head-sub{font-size:11px;opacity:.8;margin-top:1px}
+    #_zw-close{background:none;border:none;color:#fff;cursor:pointer;opacity:.8;font-size:20px;line-height:1;padding:2px}
+    #_zw-close:hover{opacity:1}
+    #_zw-msgs{flex:1;overflow-y:auto;padding:14px 12px;display:flex;flex-direction:column;gap:8px;background:#f9fafb}
+    #_zw-msgs::-webkit-scrollbar{width:4px}
+    #_zw-msgs::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:2px}
+    ._zw-bubble{max-width:82%;padding:9px 13px;border-radius:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-size:13.5px}
+    ._zw-bubble.user{align-self:flex-end;background:#0d7fe8;color:#fff;border-bottom-right-radius:3px}
+    ._zw-bubble.bot{align-self:flex-start;background:#fff;color:#111;border-bottom-left-radius:3px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+    ._zw-bubble.typing{align-self:flex-start;background:#fff;color:#9ca3af;font-style:italic;
+      box-shadow:0 1px 3px rgba(0,0,0,.08);border-bottom-left-radius:3px}
+    #_zw-footer{border-top:1px solid #e5e7eb;padding:10px;background:#fff;flex-shrink:0;display:flex;gap:8px}
+    #_zw-input{flex:1;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;font-size:13.5px;
+      outline:none;resize:none;font-family:inherit;line-height:1.4;max-height:80px}
+    #_zw-input:focus{border-color:#0d7fe8}
+    #_zw-send{background:#0d7fe8;color:#fff;border:none;border-radius:8px;padding:8px 14px;
+      cursor:pointer;font-weight:600;font-size:13px;flex-shrink:0;transition:background .15s}
+    #_zw-send:hover{background:#0b6fd0}
+    #_zw-send:disabled{background:#93c5fd;cursor:not-allowed}
+  \`;
+
+  var style = document.createElement('style');
+  style.textContent = css;
+  document.head.appendChild(style);
+
+  var wrap = document.createElement('div');
+  wrap.id = '_zw';
+  wrap.innerHTML = \`
+    <div id="_zw-box" class="hide">
+      <div id="_zw-head">
+        <div id="_zw-head-avatar">Z</div>
+        <div id="_zw-head-info">
+          <div id="_zw-head-name">\${NAME}</div>
+          <div id="_zw-head-sub">AI Pharmacy Assistant</div>
+        </div>
+        <button id="_zw-close" title="Close">&times;</button>
+      </div>
+      <div id="_zw-msgs"></div>
+      <div id="_zw-footer">
+        <textarea id="_zw-input" placeholder="Type a message…" rows="1"></textarea>
+        <button id="_zw-send">Send</button>
+      </div>
+    </div>
+    <button id="_zw-btn" title="Chat with us">
+      <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    </button>
+  \`;
+  document.body.appendChild(wrap);
+
+  var box   = document.getElementById('_zw-box');
+  var msgs  = document.getElementById('_zw-msgs');
+  var input = document.getElementById('_zw-input');
+  var send  = document.getElementById('_zw-send');
+
+  function bubble(text, role) {
+    var el = document.createElement('div');
+    el.className = '_zw-bubble ' + role;
+    el.textContent = text;
+    msgs.appendChild(el);
+    msgs.scrollTop = msgs.scrollHeight;
+    return el;
+  }
+
+  function setTyping() {
+    var el = bubble('Typing…', 'typing');
+    msgs.scrollTop = msgs.scrollHeight;
+    return el;
+  }
+
+  function sendMsg(text, attachment) {
+    var body = new FormData();
+    body.append('widgetKey', KEY);
+    body.append('text', text || '');
+    if (sid) body.append('conversationId', sid);
+    if (attachment) body.append('attachment', attachment);
+    return fetch(API + '/api/web/message', { method: 'POST', body: body })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.conversationId) { sid = d.conversationId; sessionStorage.setItem(SK, sid); }
+        return d;
+      });
+  }
+
+  function submit() {
+    var text = input.value.trim();
+    if (!text || send.disabled) return;
+    bubble(text, 'user');
+    input.value = '';
+    input.style.height = '';
+    send.disabled = true;
+    var t = setTyping();
+    sendMsg(text)
+      .then(function(d){ t.remove(); bubble(d.reply, 'bot'); })
+      .catch(function(){ t.remove(); bubble('Something went wrong. Please try again.', 'bot'); })
+      .finally(function(){ send.disabled = false; input.focus(); });
+  }
+
+  function toggleOpen() {
+    open = !open;
+    box.classList.toggle('hide', !open);
+    if (open && msgs.children.length === 0) {
+      send.disabled = true;
+      var t = setTyping();
+      sendMsg('Hi')
+        .then(function(d){ t.remove(); bubble(d.reply, 'bot'); })
+        .catch(function(){ t.remove(); })
+        .finally(function(){ send.disabled = false; });
+    }
+    if (open) setTimeout(function(){ input.focus(); }, 50);
+  }
+
+  document.getElementById('_zw-btn').addEventListener('click', toggleOpen);
+  document.getElementById('_zw-close').addEventListener('click', toggleOpen);
+  send.addEventListener('click', submit);
+  input.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+  });
+  input.addEventListener('input', function(){
+    this.style.height = '';
+    this.style.height = Math.min(this.scrollHeight, 80) + 'px';
+  });
+})();`;
+
+    res.type('application/javascript').set('Cache-Control', 'public, max-age=300').send(script);
+  } catch (err) {
+    res.status(500).type('application/javascript').send('/* Zero: internal error */');
+  }
+});
+
 // ─── HEALTH CHECK ─────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'LatencyZero Clinic API running', version: '3.1.0' });
