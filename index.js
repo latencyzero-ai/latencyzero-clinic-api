@@ -212,22 +212,7 @@ async function sendWhatsApp(to, message, phoneNumberId = PHONE_NUMBER_ID) {
 // Kill switch: set pharmacy_config.active = false in the DB;
 // Zero stops responding for that tenant on the very next message.
 async function resolveTenant(phoneNumberId) {
-  if (!phoneNumberId) return { business_type: 'CLINIC', config: null };
-  try {
-    const result = await pool.query(
-      'SELECT * FROM pharmacy_config WHERE phone_number_id = $1 LIMIT 1',
-      [phoneNumberId]
-    );
-    if (result.rows.length > 0) {
-      const row = result.rows[0];
-      return {
-        business_type: row.active ? 'PHARMACY' : 'PHARMACY_INACTIVE',
-        config: row,
-      };
-    }
-  } catch (e) {
-    addLog('error', 'Tenant resolution error', e.message);
-  }
+  // Pharmacy moved to web widget (widget_key); no WhatsApp tenants exist.
   return { business_type: 'CLINIC', config: null };
 }
 
