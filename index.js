@@ -1789,12 +1789,12 @@ app.get('/api/stats/today', async (req, res) => {
   try {
     const total = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`);
     const waiting = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting'`);
-    const seen = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`);
+    const seen = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status IN ('seen', 'done')`);
     const withDoctor = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'with_doctor'`);
     const appointments = await pool.query(`SELECT COUNT(*) FROM appointments WHERE DATE(created_at) = CURRENT_DATE`);
     const avgWait = await pool.query(
       `SELECT ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))/60)) as avg_minutes
-       FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'seen'`
+       FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status IN ('seen', 'done')`
     );
     res.json({
       total_today: parseInt(total.rows[0].count),
