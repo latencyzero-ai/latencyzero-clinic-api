@@ -103,8 +103,10 @@ const pharmFlow = createPharmacyProcessor({
 });
 
 // ─── GET CLINIC CONFIG ────────────────────────────────
-async function getConfig() {
-  const result = await pool.query('SELECT * FROM clinic_config LIMIT 1');
+async function getConfig(clinicId) {
+  const result = clinicId
+    ? await pool.query('SELECT * FROM clinic_config WHERE id = $1 LIMIT 1', [clinicId])
+    : await pool.query('SELECT * FROM clinic_config LIMIT 1');
   const config = result.rows[0] || { clinic_name: 'Our Clinic', agent_name: 'Zero' };
   if (!config.services || !Array.isArray(config.services)) {
     config.services = ['General Consultation', 'Dental Care', 'Cardiology', 'Neurology', 'Laboratory Tests'];
@@ -113,27 +115,30 @@ async function getConfig() {
 }
 
 // ─── GET CONVERSATION ─────────────────────────────────
-async function getConversation(phone) {
-  const result = await pool.query('SELECT * FROM conversations WHERE phone = $1', [phone]);
+async function getConversation(phone, clinicId) {
+  const result = await pool.query(
+    'SELECT * FROM conversations WHERE phone = $1 AND clinic_id = $2',
+    [phone, clinicId]
+  );
   if (result.rows.length === 0) {
     await pool.query(
-      'INSERT INTO conversations (phone, state, data) VALUES ($1, $2, $3)',
-      [phone, 'START', '{}']
+      'INSERT INTO conversations (phone, clinic_id, state, data) VALUES ($1, $2, $3, $4)',
+      [phone, clinicId, 'START', '{}']
     );
-    return { phone, state: 'START', data: {}, history: [] };
+    return { phone, clinic_id: clinicId, state: 'START', data: {}, history: [] };
   }
   const row = result.rows[0];
   return { ...row, data: row.data || {}, history: row.data?.history || [] };
 }
 
 // ─── UPDATE CONVERSATION ──────────────────────────────
-async function updateConversation(phone, state, data) {
+async function updateConversation(phone, state, data, clinicId) {
   await pool.query(
-    `INSERT INTO conversations (phone, state, data, updated_at)
-     VALUES ($1, $2, $3, NOW())
-     ON CONFLICT (phone) DO UPDATE
-     SET state = $2, data = $3, updated_at = NOW()`,
-    [phone, state, JSON.stringify(data)]
+    `INSERT INTO conversations (phone, clinic_id, state, data, updated_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (clinic_id, phone) DO UPDATE
+     SET state = $3, data = $4, updated_at = NOW()`,
+    [phone, clinicId, state, JSON.stringify(data)]
   );
 }
 
@@ -168,20 +173,20 @@ async function updatePharmacyConversation(phone, pharmacyId, state, data) {
 }
 
 // ─── GET NEXT QUEUE NUMBER ────────────────────────────
-async function getNextQueueNumber() {
+async function getNextQueueNumber(clinicId) {
   const today = new Date().toISOString().split('T')[0];
-  const existing = await pool.query('SELECT * FROM queue WHERE date = $1', [today]);
+  const existing = await pool.query('SELECT * FROM queue WHERE clinic_id = $1 AND date = $2', [clinicId, today]);
   if (existing.rows.length === 0) {
-    await pool.query('INSERT INTO queue (date, last_number) VALUES ($1, 1)', [today]);
+    await pool.query('INSERT INTO queue (clinic_id, date, last_number) VALUES ($1, $2, 1)', [clinicId, today]);
     return 1;
   }
   const next = existing.rows[0].last_number + 1;
-  await pool.query('UPDATE queue SET last_number = $1 WHERE date = $2', [next, today]);
+  await pool.query('UPDATE queue SET last_number = $1 WHERE clinic_id = $2 AND date = $3', [next, clinicId, today]);
   return next;
 }
 
 // ─── SEND WHATSAPP VIA META ───────────────────────────
-async function sendWhatsApp(to, message, phoneNumberId = PHONE_NUMBER_ID) {
+async function sendWhatsApp(to, message, phoneNumberId = PHONE_NUMBER_ID, accessToken = ACCESS_TOKEN) {
   try {
     const cleanPhone = to.replace(/[^0-9]/g, '');
     await axios.post(
@@ -194,7 +199,7 @@ async function sendWhatsApp(to, message, phoneNumberId = PHONE_NUMBER_ID) {
       },
       {
         headers: {
-          'Authorization': `Bearer ${ACCESS_TOKEN}`,
+          'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json'
         }
       }
@@ -212,8 +217,19 @@ async function sendWhatsApp(to, message, phoneNumberId = PHONE_NUMBER_ID) {
 // Kill switch: set pharmacy_config.active = false in the DB;
 // Zero stops responding for that tenant on the very next message.
 async function resolveTenant(phoneNumberId) {
-  // Pharmacy moved to web widget (widget_key); no WhatsApp tenants exist.
-  return { business_type: 'CLINIC', config: null };
+  if (!phoneNumberId) return { business_type: 'UNKNOWN', config: null };
+  try {
+    const result = await pool.query(
+      'SELECT * FROM clinic_config WHERE phone_number_id = $1 AND active = true LIMIT 1',
+      [phoneNumberId]
+    );
+    if (result.rows.length > 0) {
+      return { business_type: 'CLINIC', config: result.rows[0] };
+    }
+  } catch (e) {
+    addLog('error', 'Tenant resolution error', e.message);
+  }
+  return { business_type: 'UNKNOWN', config: null };
 }
 
 // ─── NOTIFY CLINIC ────────────────────────────────────
@@ -275,7 +291,7 @@ async function notifyClinic(type, data, config) {
   }
 
   if (config.receptionist_whatsapp) {
-    await sendWhatsApp(config.receptionist_whatsapp, clinicMsg);
+    await sendWhatsApp(config.receptionist_whatsapp, clinicMsg, config.phone_number_id, config.meta_access_token);
   }
 
   io.emit('queue_updated', { type, data });
@@ -287,20 +303,21 @@ async function checkAndSendReminders() {
     const now = new Date();
     const thirtyMinsLater = new Date(now.getTime() + 30 * 60 * 1000);
     const result = await pool.query(
-      `SELECT * FROM appointments
-       WHERE status = 'scheduled'
-       AND appointment_time > $1
-       AND appointment_time <= $2`,
+      `SELECT a.*, c.clinic_name, c.phone_number_id, c.meta_access_token
+       FROM appointments a
+       JOIN clinic_config c ON c.id = a.clinic_id
+       WHERE a.status = 'scheduled'
+       AND a.appointment_time > $1
+       AND a.appointment_time <= $2`,
       [now.toTimeString().slice(0, 8), thirtyMinsLater.toTimeString().slice(0, 8)]
     );
     for (const appt of result.rows) {
-      const cfg = await getConfig();
       const message =
         `*Reminder from Zero*\n\n` +
-        `Hi *${appt.name}*, your appointment at *${cfg.clinic_name}* is in 30 minutes.\n\n` +
+        `Hi *${appt.name}*, your appointment at *${appt.clinic_name}* is in 30 minutes.\n\n` +
         `Are you:\n1. On my way / Already here\n2. Cancel appointment\n\n` +
         `_Please reply so we can prepare for you._`;
-      await sendWhatsApp(appt.phone, message);
+      await sendWhatsApp(appt.phone, message, appt.phone_number_id, appt.meta_access_token);
       await pool.query(`UPDATE appointments SET status = 'reminder_sent' WHERE id = $1`, [appt.id]);
     }
   } catch (e) {
@@ -512,12 +529,12 @@ async function getAIRouting(complaint, symptoms) {
 }
 
 // ─── SAVE PATIENT ─────────────────────────────────────
-async function savePatient(data, queueNumber, routing) {
+async function savePatient(data, queueNumber, routing, clinicId) {
   const result = await pool.query(
     `INSERT INTO patients
-     (phone, name, age, gender, complaint, symptoms, department, urgency, queue_number, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'waiting') RETURNING *`,
-    [data.phone, data.name, data.age, data.gender,
+     (clinic_id, phone, name, age, gender, complaint, symptoms, department, urgency, queue_number, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'waiting') RETURNING *`,
+    [clinicId, data.phone, data.name, data.age, data.gender,
      data.complaint, data.symptoms,
      routing.department, routing.urgency, queueNumber]
   );
@@ -526,12 +543,12 @@ async function savePatient(data, queueNumber, routing) {
 }
 
 // ─── SAVE APPOINTMENT ─────────────────────────────────
-async function saveAppointment(data, routing) {
+async function saveAppointment(data, routing, clinicId) {
   const result = await pool.query(
     `INSERT INTO appointments
-     (phone, name, age, gender, complaint, department, appointment_date, appointment_time, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'scheduled') RETURNING *`,
-    [data.phone, data.name, data.age, data.gender,
+     (clinic_id, phone, name, age, gender, complaint, department, appointment_date, appointment_time, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'scheduled') RETURNING *`,
+    [clinicId, data.phone, data.name, data.age, data.gender,
      data.complaint, routing.department,
      data.appointment_date, data.appointment_time]
   );
@@ -563,9 +580,9 @@ function detectMenuSelection(msg) {
 }
 
 // ─── PROCESS MESSAGE ──────────────────────────────────
-async function processMessage(phone, message) {
-  const conv = await getConversation(phone);
-  const config = await getConfig();
+async function processMessage(phone, message, clinicConfig) {
+  const config = clinicConfig || await getConfig();
+  const conv = await getConversation(phone, config.id);
   const greeting = getGreeting();
 
   let data = conv.data || {};
@@ -575,10 +592,12 @@ async function processMessage(phone, message) {
   const msg = message.trim().toLowerCase();
   const now = new Date().toISOString();
 
+  const clinicId = config.id;
+
   // ── RESTART ──
   if (['restart', 'reset', 'start over', 'menu'].includes(msg)) {
     const welcomeMsg = `Your session has been restarted.`;
-    await updateConversation(phone, 'START', {});
+    await updateConversation(phone, 'START', {}, clinicId);
     return welcomeMsg;
   }
 
@@ -587,7 +606,7 @@ async function processMessage(phone, message) {
     const welcomeMsg = buildWelcome(config, greeting, false);
     history = [{ role: 'assistant', content: welcomeMsg, timestamp: now }];
     data.history = history;
-    await updateConversation(phone, 'MENU', data);
+    await updateConversation(phone, 'MENU', data, clinicId);
     return welcomeMsg;
   }
 
@@ -597,7 +616,7 @@ async function processMessage(phone, message) {
 
     if (selection === 'check_queue') {
       const patient = await pool.query(
-        'SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']
+        'SELECT * FROM patients WHERE phone = $1 AND clinic_id = $2 AND status = $3', [phone, clinicId, 'waiting']
       );
       if (patient.rows.length > 0) {
         const p = patient.rows[0];
@@ -617,7 +636,7 @@ async function processMessage(phone, message) {
 
       history.push({ role: 'assistant', content: modeReply, timestamp: now });
       data.history = history.slice(-20);
-      await updateConversation(phone, 'ACTIVE', data);
+      await updateConversation(phone, 'ACTIVE', data, clinicId);
       return modeReply;
     }
 
@@ -634,7 +653,7 @@ async function processMessage(phone, message) {
     const welcomeMsg = buildWelcome(config, greeting, true);
     const freshHistory = [{ role: 'assistant', content: welcomeMsg, timestamp: now }];
     data.history = freshHistory;
-    await updateConversation(phone, 'MENU', data);
+    await updateConversation(phone, 'MENU', data, clinicId);
     return welcomeMsg;
   }
 
@@ -644,16 +663,16 @@ async function processMessage(phone, message) {
   // Doctor queue commands
   if (['done', 'next', 'next patient', 'mark done', 'mark complete'].includes(msg)) {
     const current = await pool.query(
-      `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
+      `SELECT * FROM patients WHERE clinic_id = $1 AND status = 'waiting' ORDER BY queue_number ASC LIMIT 1`, [clinicId]
     );
     if (current.rows.length > 0) {
       await pool.query('UPDATE patients SET status = $1 WHERE id = $2', ['seen', current.rows[0].id]);
       const next = await pool.query(
-        `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
+        `SELECT * FROM patients WHERE clinic_id = $1 AND status = 'waiting' ORDER BY queue_number ASC LIMIT 1`, [clinicId]
       );
       if (next.rows.length > 0) {
         const n = next.rows[0];
-        await sendWhatsApp(n.phone, `*Hi ${n.name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`);
+        await sendWhatsApp(n.phone, `*Hi ${n.name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`, config.phone_number_id, config.meta_access_token);
         await notifyClinic('next', { queueNumber: n.queue_number, name: n.name, department: n.department, complaint: n.complaint }, config);
         io.emit('queue_updated', { type: 'next' });
         return `Patient #${current.rows[0].queue_number} marked as seen.\n\n*Next:* ${n.name} — #${n.queue_number}`;
@@ -665,7 +684,7 @@ async function processMessage(phone, message) {
   }
 
   if (['queue', 'check queue', 'my number', 'queue status'].includes(msg)) {
-    const patient = await pool.query('SELECT * FROM patients WHERE phone = $1 AND status = $2', [phone, 'waiting']);
+    const patient = await pool.query('SELECT * FROM patients WHERE phone = $1 AND clinic_id = $2 AND status = $3', [phone, clinicId, 'waiting']);
     if (patient.rows.length > 0) {
       const p = patient.rows[0];
       return `Your queue status:\n\nQueue Number: *#${p.queue_number}*\nDepartment: ${p.department}\nStatus: Waiting\n\nI'll notify you when it's your turn.`;
@@ -691,10 +710,10 @@ async function processMessage(phone, message) {
   // ── CANCEL APPOINTMENT ──
   if (aiResponse.intent === 'cancel_appointment') {
     await pool.query(
-      `UPDATE appointments SET status = 'cancelled' WHERE phone = $1 AND status IN ('scheduled', 'reminder_sent')`,
-      [phone]
+      `UPDATE appointments SET status = 'cancelled' WHERE phone = $1 AND clinic_id = $2 AND status IN ('scheduled', 'reminder_sent')`,
+      [phone, clinicId]
     );
-    await updateConversation(phone, 'START', {});
+    await updateConversation(phone, 'START', {}, clinicId);
     return `Your appointment has been cancelled${data.name ? ', ' + data.name : ''}.\n\nMessage us anytime to rebook.\n\n_— Zero_`;
   }
 
@@ -705,7 +724,7 @@ async function processMessage(phone, message) {
       const reply = `Could you share your full name, age and gender?`;
       history.push({ role: 'assistant', content: reply, timestamp: now });
       data.history = history.slice(-20);
-      await updateConversation(phone, 'ACTIVE', data);
+      await updateConversation(phone, 'ACTIVE', data, clinicId);
       return reply;
     }
 
@@ -713,7 +732,7 @@ async function processMessage(phone, message) {
       const reply = `What brings you to the clinic today?`;
       history.push({ role: 'assistant', content: reply, timestamp: now });
       data.history = history.slice(-20);
-      await updateConversation(phone, 'ACTIVE', data);
+      await updateConversation(phone, 'ACTIVE', data, clinicId);
       return reply;
     }
 
@@ -721,7 +740,7 @@ async function processMessage(phone, message) {
       const reply = `Can you tell me a bit more about what you're experiencing?`;
       history.push({ role: 'assistant', content: reply, timestamp: now });
       data.history = history.slice(-20);
-      await updateConversation(phone, 'ACTIVE', data);
+      await updateConversation(phone, 'ACTIVE', data, clinicId);
       return reply;
     }
 
@@ -730,19 +749,19 @@ async function processMessage(phone, message) {
         const reply = `What date would you like to come in?\n_(e.g. "Tomorrow", "Monday", "27th May")_`;
         history.push({ role: 'assistant', content: reply, timestamp: now });
         data.history = history.slice(-20);
-        await updateConversation(phone, 'ACTIVE', data);
+        await updateConversation(phone, 'ACTIVE', data, clinicId);
         return reply;
       }
       if (!data.appointment_time) {
         const reply = `And what time works for you?\n_(e.g. "9am", "2pm", "afternoon")_`;
         history.push({ role: 'assistant', content: reply, timestamp: now });
         data.history = history.slice(-20);
-        await updateConversation(phone, 'ACTIVE', data);
+        await updateConversation(phone, 'ACTIVE', data, clinicId);
         return reply;
       }
 
       const routing = await getAIRouting(data.complaint, data.symptoms || '');
-      await saveAppointment(data, routing);
+      await saveAppointment(data, routing, clinicId);
       await notifyClinic('appointment', {
         name: data.name, age: data.age, gender: data.gender,
         phone, complaint: data.complaint, department: routing.department,
@@ -752,7 +771,7 @@ async function processMessage(phone, message) {
 
       const confirmMsg = `*Appointment confirmed, ${data.name}.*\n\nDate: *${data.appointment_date}*\nTime: *${data.appointment_time}*\nDepartment: *${routing.department}*\n\nPlease arrive 10 minutes early.\n\n_See you soon — Zero_`;
       history.push({ role: 'assistant', content: confirmMsg, timestamp: now });
-      await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
+      await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) }, clinicId);
       return confirmMsg;
     }
 
@@ -768,13 +787,13 @@ async function processMessage(phone, message) {
 
       const onWayMsg = `*Got it, ${data.name}.*\n\nThe clinic has been notified you're on your way.\n\nLikely Department: *${routing.department}*\n\nA queue number will be assigned when you arrive.\n\n_See you soon — Zero_`;
       history.push({ role: 'assistant', content: onWayMsg, timestamp: now });
-      await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
+      await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) }, clinicId);
       return onWayMsg;
     }
 
     // ── WALK-IN ──
-    const queueNumber = await getNextQueueNumber();
-    await savePatient(data, queueNumber, routing);
+    const queueNumber = await getNextQueueNumber(clinicId);
+    await savePatient(data, queueNumber, routing, clinicId);
     await notifyClinic('walkin', {
       queueNumber, name: data.name, age: data.age, gender: data.gender,
       phone, complaint: data.complaint, symptoms: data.symptoms || '',
@@ -784,14 +803,14 @@ async function processMessage(phone, message) {
 
     const walkinMsg = `*You're all set, ${data.name}.*\n\nQueue Number: *#${queueNumber}*\nDepartment: *${routing.department}*\nUrgency: *${routing.urgency}*\n\nPlease take a seat at reception. I'll message you when it's your turn.\n\n_Thank you for your patience — Zero_`;
     history.push({ role: 'assistant', content: walkinMsg, timestamp: now });
-    await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) });
+    await updateConversation(phone, 'DONE', { ...data, history: history.slice(-50) }, clinicId);
     return walkinMsg;
   }
 
   // ── CONTINUE CONVERSATION ──
   history.push({ role: 'assistant', content: aiResponse.reply, timestamp: now });
   data.history = history.slice(-20);
-  await updateConversation(phone, 'ACTIVE', data);
+  await updateConversation(phone, 'ACTIVE', data, clinicId);
   return aiResponse.reply;
 }
 
@@ -1490,7 +1509,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
     const incomingPhoneNumberId = value.metadata?.phone_number_id;
     const tenant = await resolveTenant(incomingPhoneNumberId);
-    addLog('info', `Message from ${phone} [${tenant.business_type}]: ${message || '(media)'}`);
+
+    if (tenant.business_type === 'UNKNOWN') {
+      addLog('warn', `Unknown phone_number_id: ${incomingPhoneNumberId} — message dropped`);
+      return;
+    }
+
+    addLog('info', `Message from ${phone} [CLINIC:${tenant.config.clinic_name}]: ${message || '(media)'}`);
 
     io.emit('new_message', {
       conversationId: phone,
@@ -1505,21 +1530,8 @@ app.post('/webhook/whatsapp', async (req, res) => {
       }
     });
 
-    // Kill switch: pharmacy exists but active = false — drop silently
-    if (tenant.business_type === 'PHARMACY_INACTIVE') {
-      addLog('info', `[INACTIVE] ${tenant.config.pharmacy_name} — message from ${phone} dropped`);
-      return;
-    }
-
-    let reply;
-    if (tenant.business_type === 'PHARMACY') {
-      const adapter = loadAdapter(tenant.config, pool);
-      reply = await pharmFlow.processPharmacyMessage(phone, message, mediaAttachment, tenant.config, adapter);
-      if (reply) await sendWhatsApp(phone, reply, tenant.config.phone_number_id);
-    } else {
-      reply = await processMessage(phone, message);
-      await sendWhatsApp(phone, reply);
-    }
+    const reply = await processMessage(phone, message, tenant.config);
+    if (reply) await sendWhatsApp(phone, reply, tenant.config.phone_number_id, tenant.config.meta_access_token);
 
     io.emit('new_message', {
       conversationId: phone,
@@ -1614,11 +1626,14 @@ app.post('/webhook/payment', async (req, res) => {
 // ─── ZEROCHAT CONVERSATION ENDPOINTS ──────────────────
 app.get('/api/conversations', async (req, res) => {
   try {
+    const { clinic_id } = req.query;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
     const result = await pool.query(
       `SELECT phone, state, data, created_at, updated_at
        FROM conversations
-       WHERE state != 'START'
-       ORDER BY updated_at DESC`
+       WHERE clinic_id = $1 AND state != 'START'
+       ORDER BY updated_at DESC`,
+      [clinic_id]
     );
     const rows = result.rows.map(row => {
       const data = row.data || {};
@@ -1652,7 +1667,11 @@ app.get('/api/conversations', async (req, res) => {
 app.get('/api/conversations/:id/messages', async (req, res) => {
   try {
     const { id } = req.params;
-    const conv = await pool.query('SELECT * FROM conversations WHERE phone = $1', [id]);
+    const { clinic_id } = req.query;
+    const conv = await pool.query(
+      'SELECT * FROM conversations WHERE phone = $1' + (clinic_id ? ' AND clinic_id = $2' : ''),
+      clinic_id ? [id, clinic_id] : [id]
+    );
     if (conv.rows.length === 0) return res.json([]);
 
     const data = conv.rows[0].data || {};
@@ -1679,8 +1698,9 @@ app.get('/api/conversations/:id/messages', async (req, res) => {
 app.post('/api/conversations/:id/reply', async (req, res) => {
   try {
     const { id } = req.params;
-    const { body } = req.body;
-    await sendWhatsApp(id, body);
+    const { body, clinic_id } = req.body;
+    const cfg = clinic_id ? await getConfig(clinic_id) : { phone_number_id: PHONE_NUMBER_ID, meta_access_token: ACCESS_TOKEN };
+    await sendWhatsApp(id, body, cfg.phone_number_id, cfg.meta_access_token);
     const now = new Date().toISOString();
     const message = {
       id: `staff_${Date.now()}`,
@@ -1752,8 +1772,11 @@ app.patch('/api/conversations/:id/ai-pause', async (req, res) => {
 // ─── PATIENT & QUEUE ENDPOINTS ────────────────────────
 app.get('/api/patients/active', async (req, res) => {
   try {
+    const { clinic_id } = req.query;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
     const result = await pool.query(
-      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting' ORDER BY queue_number ASC`
+      `SELECT * FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE AND status = 'waiting' ORDER BY queue_number ASC`,
+      [clinic_id]
     );
     res.json(result.rows);
   } catch (error) {
@@ -1777,8 +1800,11 @@ function normalizePatient(p) {
 
 app.get('/api/patients', async (req, res) => {
   try {
+    const { clinic_id } = req.query;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
     const result = await pool.query(
-      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE ORDER BY queue_number ASC`
+      `SELECT * FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE ORDER BY queue_number ASC`,
+      [clinic_id]
     );
     res.json(result.rows.map(normalizePatient));
   } catch (error) {
@@ -1788,8 +1814,11 @@ app.get('/api/patients', async (req, res) => {
 
 app.get('/api/queue', async (req, res) => {
   try {
+    const { clinic_id } = req.query;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
     const result = await pool.query(
-      `SELECT * FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting' ORDER BY queue_number ASC`
+      `SELECT * FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE AND status = 'waiting' ORDER BY queue_number ASC`,
+      [clinic_id]
     );
     res.json(result.rows);
   } catch (error) {
@@ -1799,14 +1828,17 @@ app.get('/api/queue', async (req, res) => {
 
 app.get('/api/stats/today', async (req, res) => {
   try {
-    const total = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE`);
-    const waiting = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'waiting'`);
-    const seen = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status IN ('seen', 'done')`);
-    const withDoctor = await pool.query(`SELECT COUNT(*) FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status = 'with_doctor'`);
-    const appointments = await pool.query(`SELECT COUNT(*) FROM appointments WHERE DATE(created_at) = CURRENT_DATE`);
+    const { clinic_id } = req.query;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
+    const total = await pool.query(`SELECT COUNT(*) FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE`, [clinic_id]);
+    const waiting = await pool.query(`SELECT COUNT(*) FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE AND status = 'waiting'`, [clinic_id]);
+    const seen = await pool.query(`SELECT COUNT(*) FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE AND status IN ('seen', 'done')`, [clinic_id]);
+    const withDoctor = await pool.query(`SELECT COUNT(*) FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE AND status = 'with_doctor'`, [clinic_id]);
+    const appointments = await pool.query(`SELECT COUNT(*) FROM appointments WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE`, [clinic_id]);
     const avgWait = await pool.query(
       `SELECT ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))/60)) as avg_minutes
-       FROM patients WHERE DATE(created_at) = CURRENT_DATE AND status IN ('seen', 'done')`
+       FROM patients WHERE clinic_id = $1 AND DATE(created_at) = CURRENT_DATE AND status IN ('seen', 'done')`,
+      [clinic_id]
     );
     res.json({
       total_today: parseInt(total.rows[0].count),
@@ -1832,7 +1864,8 @@ app.patch('/api/patients/:id/status', async (req, res) => {
     let dbStatus = status.toLowerCase();
     let result;
     if (generate_queue) {
-      const queueNumber = await getNextQueueNumber();
+      const { clinic_id } = req.body;
+      const queueNumber = await getNextQueueNumber(clinic_id);
       result = await pool.query(
         `UPDATE patients SET status = 'waiting', queue_number = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
         [queueNumber, id]
@@ -1854,9 +1887,12 @@ app.patch('/api/patients/:id/status', async (req, res) => {
 
 app.post('/api/queue/next', async (req, res) => {
   try {
-    const config = await getConfig();
+    const clinic_id = req.body?.clinic_id || req.query?.clinic_id;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
+    const config = await getConfig(clinic_id);
     const current = await pool.query(
-      `SELECT * FROM patients WHERE status = 'waiting' ORDER BY queue_number ASC LIMIT 1`
+      `SELECT * FROM patients WHERE clinic_id = $1 AND status = 'waiting' ORDER BY queue_number ASC LIMIT 1`,
+      [clinic_id]
     );
     if (current.rows.length === 0) {
       return res.json({ success: false, message: 'No patients in queue', next: null });
@@ -1865,8 +1901,10 @@ app.post('/api/queue/next', async (req, res) => {
       `UPDATE patients SET status = 'with_doctor', updated_at = NOW() WHERE id = $1 RETURNING *`,
       [current.rows[0].id]
     );
-    await sendWhatsApp(current.rows[0].phone,
-      `*Hi ${current.rows[0].name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`
+    await sendWhatsApp(
+      current.rows[0].phone,
+      `*Hi ${current.rows[0].name}.* It's your turn.\n\nPlease proceed to the consultation room. The doctor is ready for you.\n\n_— Zero_`,
+      config.phone_number_id, config.meta_access_token
     );
     const patient = normalizePatient(updated.rows[0]);
     io.emit('queue_updated', { type: 'next', patient });
@@ -1878,8 +1916,45 @@ app.post('/api/queue/next', async (req, res) => {
 
 app.get('/api/appointments', async (req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM appointments ORDER BY created_at DESC`);
+    const { clinic_id } = req.query;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
+    const result = await pool.query(`SELECT * FROM appointments WHERE clinic_id = $1 ORDER BY created_at DESC`, [clinic_id]);
     res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── AUTH ─────────────────────────────────────────────
+app.post('/api/auth/pin', async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin) return res.status(400).json({ error: 'PIN required' });
+    const result = await pool.query(
+      'SELECT id, clinic_name, agent_name, services FROM clinic_config WHERE dashboard_pin = $1 AND active = true LIMIT 1',
+      [String(pin)]
+    );
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid PIN' });
+    const clinic = result.rows[0];
+    res.json({ clinic_id: clinic.id, clinic_name: clinic.clinic_name, agent_name: clinic.agent_name });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/clinic/setup', async (req, res) => {
+  try {
+    const { clinic_name, phone_number, pin } = req.body;
+    if (!clinic_name || !pin) return res.status(400).json({ error: 'clinic_name and pin required' });
+    const existing = await pool.query('SELECT id FROM clinic_config WHERE dashboard_pin = $1', [String(pin)]);
+    if (existing.rows.length > 0) return res.status(409).json({ error: 'PIN already in use' });
+    const result = await pool.query(
+      `INSERT INTO clinic_config (clinic_name, agent_name, dashboard_pin, active)
+       VALUES ($1, 'Zero', $2, true) RETURNING id, clinic_name, agent_name`,
+      [clinic_name, String(pin)]
+    );
+    const clinic = result.rows[0];
+    res.json({ clinic_id: clinic.id, clinic_name: clinic.clinic_name, agent_name: clinic.agent_name });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
