@@ -46,7 +46,7 @@ class NativeAdapter extends BaseAdapter {
   }
 
   async savePrescription(_file) {
-    // TODO: upload to an S3-compatible bucket (Railway Volumes or Cloudflare R2)
+    // TODO: upload to an S3-compatible bucket (Render Disk or Cloudflare R2)
     // and return the URL.
     throw new Error('NativeAdapter: savePrescription() not yet implemented.');
   }

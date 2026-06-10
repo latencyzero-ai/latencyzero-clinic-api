@@ -87,7 +87,7 @@ class SupabaseAdapter extends BaseAdapter {
       throw new Error(
         adapterConfig.service_key_env
           ? `SupabaseAdapter: env var "${adapterConfig.service_key_env}" is not set on this server. ` +
-            `Add it in Railway → Variables.`
+            `Add it in Render → Environment.`
           : 'SupabaseAdapter: adapter_config must include "service_key" or "service_key_env".'
       );
     }

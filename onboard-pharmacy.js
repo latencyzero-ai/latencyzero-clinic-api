@@ -25,8 +25,8 @@
  *
  * SECRETS — never pass on the command line (they appear in shell history):
  *   --service-key-env accepts an ENV VAR NAME only (e.g. OCHESTA_SERVICE_KEY).
- *   The actual Supabase service role key is set as that variable in Railway
- *   (Settings → Variables). It is NEVER stored in pharmacy_config.
+ *   The actual Supabase service role key is set as that variable in Render
+ *   (Environment). It is NEVER stored in pharmacy_config.
  *
  * DATABASE_URL is read from .env (the same file the server uses).
  */
@@ -118,7 +118,7 @@ async function uniqueWidgetKey(pool, maxAttempts = 5) {
 function embedSnippet(widgetKey, currency) {
   return `<!-- ═══════════════════ Zero Pharmacy Widget ══════════════════════
   1. Paste this block before </body> on every page the chat should appear.
-  2. Set ZERO_API to your Zero Pharmacy server URL (Railway domain).
+  2. Set ZERO_API to your Zero Pharmacy server URL (Render URL).
   3. Do NOT change WIDGET_KEY — it identifies your account.
   4. Remove the "minimal demo UI" section once your own chat UI is wired up.
   ══════════════════════════════════════════════════════════════════════ -->
@@ -126,7 +126,7 @@ function embedSnippet(widgetKey, currency) {
 <script>
 (function () {
   /* ── configuration ─────────────────────────────────────────────────── */
-  var ZERO_API   = 'https://YOUR-ZERO-API.railway.app'; // ← your server URL
+  var ZERO_API   = 'https://latencyzero-clinic-api.onrender.com'; // ← your server URL
   var WIDGET_KEY = '${widgetKey}';                        // ← do not change
   var CURRENCY   = '${currency}';
 
@@ -312,7 +312,7 @@ function printChecklist(opts) {
     dryRun,
   } = opts;
 
-  const ZERO_API = 'https://YOUR-ZERO-API.railway.app';
+  const ZERO_API = 'https://latencyzero-clinic-api.onrender.com';
 
   console.log(`\n${HR2}`);
   console.log(b(c('  Setup checklist')));
@@ -320,11 +320,11 @@ function printChecklist(opts) {
   console.log(HR2);
 
   // ── Step 1: Set the service role key env var on the server ─────────────────
-  console.log(`\n${b(bl('Step 1 — Set the Supabase service role key in Railway'))}`);
+  console.log(`\n${b(bl('Step 1 — Set the Supabase service role key in Render'))}`);
   console.log(`  The adapter_config stored in the DB holds only the env-var NAME:`);
   console.log(`    ${b('service_key_env')} = ${b(serviceKeyEnv || 'OCHESTA_SERVICE_KEY')}`);
   console.log(`\n  Set the ACTUAL service role key (${b('secret — never paste here')}):`);
-  console.log(`    Railway → your project → Variables → New Variable`);
+  console.log(`    Render → your service → Environment → Add Environment Variable`);
   console.log(`    Name  : ${b(serviceKeyEnv || 'OCHESTA_SERVICE_KEY')}`);
   console.log(`    Value : ${b('<Supabase service role key>')}`);
   console.log(`             (Supabase → Project Settings → API → service_role)`);
@@ -379,7 +379,7 @@ function printChecklist(opts) {
   }
 
   const stepN = adapterType === 'supabase' ? 5 : 2;
-  console.log(`  Replace ${b('YOUR-ZERO-API.railway.app')} with your actual Railway domain.`);
+  console.log(`  The embed snippet is pre-filled with ${b('latencyzero-clinic-api.onrender.com')}.`);
   if (handoffNumber) {
     console.log(`  Handoff number ${b(handoffNumber)} is configured — the widget will show`);
     console.log(`  a "Chat on WhatsApp" button when Zero flags a conversation.`);
