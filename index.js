@@ -1960,6 +1960,66 @@ app.post('/api/clinic/setup', async (req, res) => {
   }
 });
 
+app.patch('/api/clinic/settings', async (req, res) => {
+  try {
+    const { clinic_id, clinic_name, agent_name, receptionist_whatsapp, doctor_whatsapp, services, phone_number_id, meta_access_token } = req.body;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
+
+    const allowed = ['clinic_name', 'agent_name', 'receptionist_whatsapp', 'doctor_whatsapp', 'services', 'phone_number_id', 'meta_access_token'];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    const updates = { clinic_name, agent_name, receptionist_whatsapp, doctor_whatsapp, services, phone_number_id, meta_access_token };
+    for (const key of allowed) {
+      if (updates[key] !== undefined && updates[key] !== null) {
+        if (key === 'services') {
+          fields.push(`${key} = $${idx++}::jsonb`);
+          values.push(JSON.stringify(updates[key]));
+        } else {
+          fields.push(`${key} = $${idx++}`);
+          values.push(updates[key]);
+        }
+      }
+    }
+
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    if (phone_number_id) {
+      const conflict = await pool.query(
+        'SELECT id FROM clinic_config WHERE phone_number_id = $1 AND id != $2',
+        [phone_number_id, clinic_id]
+      );
+      if (conflict.rows.length > 0) return res.status(409).json({ error: 'That WhatsApp number is already registered to another clinic' });
+    }
+
+    values.push(clinic_id);
+    const result = await pool.query(
+      `UPDATE clinic_config SET ${fields.join(', ')} WHERE id = $${idx} RETURNING id, clinic_name, agent_name, receptionist_whatsapp, doctor_whatsapp, services, phone_number_id`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Clinic not found' });
+    res.json({ clinic: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/clinic/settings', async (req, res) => {
+  try {
+    const { clinic_id } = req.query;
+    if (!clinic_id) return res.status(400).json({ error: 'clinic_id required' });
+    const result = await pool.query(
+      'SELECT id, clinic_name, agent_name, receptionist_whatsapp, doctor_whatsapp, services, phone_number_id FROM clinic_config WHERE id = $1',
+      [clinic_id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Clinic not found' });
+    res.json({ clinic: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ─── ADMIN ENDPOINTS (LatencyZero internal) ───────────
 
 app.get('/api/admin/health', adminAuth, async (req, res) => {
