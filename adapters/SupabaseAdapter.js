@@ -65,6 +65,39 @@ function requireSupabase() {
   }
 }
 
+// Logs the COMPLETE Supabase error server-side (message + details + hint + code
+// — these reveal RLS denials, missing columns, and JSONB shape problems) and
+// returns an Error carrying the structured fields so upstream catches can log
+// them too. User-facing replies stay generic; the server log carries the truth.
+function supabaseError(method, error) {
+  console.error(
+    `[SupabaseAdapter.${method}]`,
+    error.message,
+    error.details || '',
+    error.hint    || '',
+    error.code    || ''
+  );
+  const err   = new Error(`SupabaseAdapter.${method}: ${error.message}`);
+  err.details = error.details || null;
+  err.hint    = error.hint    || null;
+  err.code    = error.code    || null;
+  return err;
+}
+
+// Decodes a Supabase JWT payload WITHOUT verifying the signature — just enough
+// to read the "role" claim ('service_role' vs 'anon'). Never logs the key.
+// Returns null when the value is not a decodable JWT.
+function decodeJwtRole(key) {
+  try {
+    const payload = JSON.parse(
+      Buffer.from(key.split('.')[1], 'base64url').toString('utf8')
+    );
+    return payload.role || null;
+  } catch {
+    return null;
+  }
+}
+
 class SupabaseAdapter extends BaseAdapter {
   constructor(adapterConfig) {
     super(adapterConfig);
@@ -89,6 +122,17 @@ class SupabaseAdapter extends BaseAdapter {
           ? `SupabaseAdapter: env var "${adapterConfig.service_key_env}" is not set on this server. ` +
             `Add it in Render → Environment.`
           : 'SupabaseAdapter: adapter_config must include "service_key" or "service_key_env".'
+      );
+    }
+
+    // Guard against the most common production mistake: the anon key (or a
+    // malformed value) configured where the service_role key belongs. Writes
+    // would then silently hit RLS. Logs the role claim only — never the key.
+    const role = decodeJwtRole(serviceKey);
+    if (role !== 'service_role') {
+      console.error(
+        `[SupabaseAdapter] WARNING: resolved Supabase key has role "${role}" — NOT service_role. ` +
+        `Writes (orders, stock, prescriptions) will fail under RLS. Check the key configured on Render.`
       );
     }
 
@@ -142,7 +186,7 @@ class SupabaseAdapter extends BaseAdapter {
     if (query)    q = q.ilike('name', `%${query}%`);
 
     const { data, error } = await q;
-    if (error) throw new Error(`SupabaseAdapter.getProducts: ${error.message}`);
+    if (error) throw supabaseError('getProducts', error);
 
     return (data || []).map(p => ({
       id                    : p.id,
@@ -166,7 +210,7 @@ class SupabaseAdapter extends BaseAdapter {
 
     if (error) {
       if (error.code === 'PGRST116') return 0; // no row — treat as out of stock
-      throw new Error(`SupabaseAdapter.checkStock: ${error.message}`);
+      throw supabaseError('checkStock', error);
     }
 
     return data?.stock_qty ?? 0;
@@ -186,7 +230,7 @@ class SupabaseAdapter extends BaseAdapter {
       .from('prescriptions')
       .upload(path, file.buffer, { contentType: file.mimetype, upsert: false });
 
-    if (error) throw new Error(`SupabaseAdapter.savePrescription: ${error.message}`);
+    if (error) throw supabaseError('savePrescription', error);
 
     const { data: urlData } = this._client.storage
       .from('prescriptions')
@@ -275,7 +319,7 @@ class SupabaseAdapter extends BaseAdapter {
       // 23505 = unique_violation — another order already has this ID, try again.
       if (error.code === '23505') continue;
 
-      throw new Error(`SupabaseAdapter.createOrder: ${error.message}`);
+      throw supabaseError('createOrder', error);
     }
 
     throw new Error(
@@ -296,7 +340,8 @@ class SupabaseAdapter extends BaseAdapter {
 
     console.warn(
       '[SupabaseAdapter] decrement_stock RPC unavailable — falling back to per-item UPDATEs ' +
-      '(not atomic). Install the decrement_stock function in Supabase SQL editor to fix this.'
+      '(not atomic). Install the decrement_stock function in Supabase SQL editor to fix this. ' +
+      `RPC error: ${rpcErr.message} ${rpcErr.details || ''} ${rpcErr.hint || ''} ${rpcErr.code || ''}`
     );
 
     for (const item of items) {
@@ -309,9 +354,7 @@ class SupabaseAdapter extends BaseAdapter {
         .eq('id', item.product_id);
 
       if (error) {
-        throw new Error(
-          `SupabaseAdapter.decrementStock (product ${item.product_id}): ${error.message}`
-        );
+        throw supabaseError(`decrementStock (product ${item.product_id})`, error);
       }
     }
   }
@@ -329,9 +372,9 @@ class SupabaseAdapter extends BaseAdapter {
       .order('created_at', { ascending: false })
       .limit(20);
 
-    if (error) throw new Error(`SupabaseAdapter.getCustomerOrders: ${error.message}`);
+    if (error) throw supabaseError('getCustomerOrders', error);
     return data || [];
   }
 }
 
-module.exports = { SupabaseAdapter };
+module.exports = { SupabaseAdapter, decodeJwtRole };

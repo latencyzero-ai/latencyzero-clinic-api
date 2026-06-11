@@ -14,6 +14,7 @@ const crypto = require('crypto');
 
 const multer = require('multer');
 const { loadAdapter } = require('./adapters');
+const { decodeJwtRole } = require('./adapters/SupabaseAdapter');
 const { createPharmacyProcessor } = require('./pharmacyFlow');
 
 const app = express();
@@ -2724,6 +2725,145 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   }
 });
 
+// ─── TEMPORARY DIAGNOSTIC: OCHESTA WRITE PATH ─────────────────────────────────
+// GET /api/diag/ochesta?t=<DIAG_TOKEN>[&key=<widgetKey>]
+//
+// Pinpoints read-vs-write-vs-shape failures in ONE call:
+//   a) read 1 row from products
+//   b) insert a clearly-fake test row into orders (status 'diag_test',
+//      customer "ZERO DIAG — IGNORE") using the EXACT shape createOrder writes
+//   c) delete that test row
+// Each step returns ok:true/false plus the raw Supabase error if any.
+// Also reports (WITHOUT printing the key) whether the service key resolves and
+// what role its JWT carries.
+//
+// Protected by DIAG_TOKEN env var; disabled when unset. REMOVE this endpoint
+// once the production order issue is resolved.
+app.get('/api/diag/ochesta', async (req, res) => {
+  const DIAG_TOKEN = process.env.DIAG_TOKEN;
+  if (!DIAG_TOKEN) return res.status(503).json({ error: 'DIAG_TOKEN env var is not set — endpoint disabled.' });
+  if (req.query.t !== DIAG_TOKEN) return res.status(403).json({ error: 'Forbidden' });
+
+  const fmt = e => e
+    ? { message: e.message, details: e.details || null, hint: e.hint || null, code: e.code || null }
+    : null;
+  const out = { pharmacy: null, env: {}, steps: {} };
+
+  try {
+    // Resolve the tenant: explicit ?key=<widgetKey>, else first supabase pharmacy
+    const cfgRes = req.query.key
+      ? await pool.query('SELECT * FROM pharmacy_config WHERE widget_key = $1 LIMIT 1', [req.query.key])
+      : await pool.query(`SELECT * FROM pharmacy_config WHERE adapter_type = 'supabase' ORDER BY id LIMIT 1`);
+    const config = cfgRes.rows[0];
+    if (!config) return res.status(404).json({ ...out, error: 'No supabase pharmacy_config row found.' });
+    out.pharmacy = { id: config.id, name: config.pharmacy_name, adapter_type: config.adapter_type };
+
+    // Key/env report — never the key value itself
+    const acfg        = config.adapter_config || {};
+    const resolvedKey = acfg.service_key_env ? process.env[acfg.service_key_env] : acfg.service_key;
+    out.env = {
+      url_present : !!acfg.url,
+      key_source  : acfg.service_key_env
+        ? `env:${acfg.service_key_env}`
+        : (acfg.service_key ? 'adapter_config.service_key' : 'MISSING'),
+      key_present : !!resolvedKey,
+      key_role    : resolvedKey ? decodeJwtRole(resolvedKey) : null,
+    };
+
+    let adapter;
+    try {
+      adapter = loadAdapter(config, pool);
+      out.steps.load_adapter = { ok: true };
+    } catch (e) {
+      out.steps.load_adapter = { ok: false, error: fmt(e) };
+      return res.json(out);
+    }
+
+    const client = adapter._client; // raw service-role client — diagnostic use only
+
+    // a) READ — 1 row from products
+    {
+      const { data, error } = await client.from('products').select('id, name').limit(1);
+      out.steps.read_products = { ok: !error, rows: data ? data.length : 0, error: fmt(error) };
+    }
+
+    // b) WRITE — insert a fake order with the exact column + JSONB shape createOrder uses
+    const testId = `OCP-${Math.floor(100000 + Math.random() * 900000)}`;
+    {
+      const { error } = await client.from('orders').insert({
+        id             : testId,
+        customer_name  : 'ZERO DIAG — IGNORE',
+        customer_phone : '0000000000',
+        total_amount   : 0,
+        status         : 'diag_test',
+        items          : {
+          cart             : [{ product_id: 'diag', name: 'diag', price: 0, quantity: 1 }],
+          customer_id      : 'diag',
+          customer_email   : null,
+          delivery_address : null,
+          delivery_city    : null,
+          prescription_url : null,
+          subtotal         : 0,
+          delivery_fee     : 0,
+          total            : 0,
+          payment_method   : null,
+        },
+      });
+      out.steps.insert_order = { ok: !error, test_id: testId, error: fmt(error) };
+    }
+
+    // c) DELETE — always attempted, in case the insert partially succeeded
+    {
+      const { error } = await client.from('orders').delete().eq('id', testId);
+      out.steps.delete_order = { ok: !error, error: fmt(error) };
+    }
+
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ ...out, fatal: e.message });
+  }
+});
+
+// ─── SUPABASE KEY SANITY CHECK (runs once on boot) ────────────────────────────
+// Logs key PRESENCE and JWT role claim only — never the key value.
+async function checkSupabaseKeysOnBoot() {
+  const url = process.env.OCHESTA_SUPABASE_URL;
+  const key = process.env.OCHESTA_SUPABASE_SERVICE_KEY;
+  console.log(`[boot] OCHESTA_SUPABASE_URL present: ${!!url}`);
+  console.log(`[boot] OCHESTA_SUPABASE_SERVICE_KEY present: ${!!key}`);
+  if (key) {
+    const role = decodeJwtRole(key);
+    console.log(`[boot] OCHESTA_SUPABASE_SERVICE_KEY role claim: ${role}`);
+    if (role !== 'service_role') {
+      console.error('[boot] WARNING: Supabase key on Render is NOT service_role — writes will fail.');
+    }
+  }
+
+  // Check the key each configured supabase tenant will actually resolve at runtime
+  try {
+    const res = await pool.query(
+      `SELECT id, pharmacy_name, adapter_config FROM pharmacy_config WHERE adapter_type = 'supabase'`
+    );
+    for (const row of res.rows) {
+      const acfg     = row.adapter_config || {};
+      const resolved = acfg.service_key_env ? process.env[acfg.service_key_env] : acfg.service_key;
+      const source   = acfg.service_key_env ? `env ${acfg.service_key_env}` : 'adapter_config.service_key';
+      if (!resolved) {
+        console.error(`[boot] WARNING: pharmacy ${row.id} (${row.pharmacy_name}): Supabase key MISSING (${source}) — all adapter calls will fail.`);
+        continue;
+      }
+      const role = decodeJwtRole(resolved);
+      if (role !== 'service_role') {
+        console.error(`[boot] WARNING: pharmacy ${row.id} (${row.pharmacy_name}): Supabase key (${source}) role is "${role}" — NOT service_role — writes will fail.`);
+      } else {
+        console.log(`[boot] pharmacy ${row.id} (${row.pharmacy_name}): Supabase key OK (service_role, via ${source}).`);
+      }
+    }
+  } catch (e) {
+    console.error('[boot] Supabase key sanity check failed:', e.message);
+  }
+}
+
 // ─── HEALTH CHECK ─────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'LatencyZero Clinic API running', version: '3.1.0' });
@@ -2737,4 +2877,5 @@ server.listen(PORT, () => {
   addLog('info', 'Meta webhook: /webhook/whatsapp');
   addLog('info', 'Admin endpoints: /api/admin/*');
   addLog('info', 'Metrics endpoints: /api/metrics/*');
+  checkSupabaseKeysOnBoot();
 });

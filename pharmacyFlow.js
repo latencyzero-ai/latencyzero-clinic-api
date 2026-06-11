@@ -627,7 +627,11 @@ Populate extracted fields ONLY when you actually observed them in the customer m
           try {
             ({ orderId } = await adapter.createOrder(orderObj));
           } catch (e) {
-            addLog('error', 'adapter.createOrder failed', e.message);
+            // Log the FULL Supabase error (details/hint/code attached by the
+            // adapter) — the user-facing reply stays generic.
+            console.error('[pharmacyFlow.createOrder]', e.message, e.details || '', e.hint || '', e.code || '');
+            addLog('error', 'adapter.createOrder failed',
+              [e.message, e.details, e.hint, e.code].filter(Boolean).join(' | '));
             const errReply = `There was a problem placing your order. Please try again or contact us directly.`;
             history.push({ role: 'assistant', content: errReply, timestamp: now });
             await saveConv(externalUserId, pharmacyConfig.id, state, history);
@@ -636,7 +640,11 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
           // Decrement stock — non-blocking; a failure here does not cancel the order
           adapter.decrementStock(state.cart.map(i => ({ product_id: i.product_id, qty: i.qty })))
-            .catch(e => addLog('error', 'adapter.decrementStock failed', e.message));
+            .catch(e => {
+              console.error('[pharmacyFlow.decrementStock]', e.message, e.details || '', e.hint || '', e.code || '');
+              addLog('error', 'adapter.decrementStock failed',
+                [e.message, e.details, e.hint, e.code].filter(Boolean).join(' | '));
+            });
 
           const needsRx = state.cart.some(i => i.requires_prescription);
           let confirmMsg;
@@ -785,7 +793,9 @@ Populate extracted fields ONLY when you actually observed them in the customer m
             state.rx_confirmed = true;
             addLog('info', `Prescription uploaded for ${externalUserId}: ${url}`);
           } catch (e) {
-            addLog('error', 'Prescription upload failed', e.message);
+            console.error('[pharmacyFlow.savePrescription]', e.message, e.details || '', e.hint || '', e.code || '');
+            addLog('error', 'Prescription upload failed',
+              [e.message, e.details, e.hint, e.code].filter(Boolean).join(' | '));
             const errMsg = `There was a problem receiving your prescription. Please try sending it again as an image or PDF.`;
             history.push({ role: 'assistant', content: errMsg, timestamp: now });
             await saveConv(externalUserId, pharmacyConfig.id, state, history);
