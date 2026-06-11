@@ -14,7 +14,7 @@ const crypto = require('crypto');
 
 const multer = require('multer');
 const { loadAdapter } = require('./adapters');
-const { decodeJwtRole } = require('./adapters/SupabaseAdapter');
+const { decodeJwtRole, isServiceLevel } = require('./adapters/SupabaseAdapter');
 const { createPharmacyProcessor } = require('./pharmacyFlow');
 
 const app = express();
@@ -2791,12 +2791,13 @@ app.get('/api/diag/ochesta', async (req, res) => {
     const testId = `OCP-${Math.floor(100000 + Math.random() * 900000)}`;
     {
       const { error } = await client.from('orders').insert({
-        id             : testId,
-        customer_name  : 'ZERO DIAG — IGNORE',
-        customer_phone : '0000000000',
-        total_amount   : 0,
-        status         : 'diag_test',
-        items          : {
+        id               : testId,
+        customer_name    : 'ZERO DIAG — IGNORE',
+        customer_phone   : '0000000000',
+        customer_address : 'ZERO DIAG — IGNORE',
+        total_amount     : 0,
+        status           : 'diag_test',
+        items            : {
           cart             : [{ product_id: 'diag', name: 'diag', price: 0, quantity: 1 }],
           customer_id      : 'diag',
           customer_email   : null,
@@ -2834,7 +2835,7 @@ async function checkSupabaseKeysOnBoot() {
   if (key) {
     const role = decodeJwtRole(key);
     console.log(`[boot] OCHESTA_SUPABASE_SERVICE_KEY role claim: ${role}`);
-    if (role !== 'service_role') {
+    if (!isServiceLevel(role)) {
       console.error('[boot] WARNING: Supabase key on Render is NOT service_role — writes will fail.');
     }
   }
@@ -2853,10 +2854,10 @@ async function checkSupabaseKeysOnBoot() {
         continue;
       }
       const role = decodeJwtRole(resolved);
-      if (role !== 'service_role') {
+      if (!isServiceLevel(role)) {
         console.error(`[boot] WARNING: pharmacy ${row.id} (${row.pharmacy_name}): Supabase key (${source}) role is "${role}" — NOT service_role — writes will fail.`);
       } else {
-        console.log(`[boot] pharmacy ${row.id} (${row.pharmacy_name}): Supabase key OK (service_role, via ${source}).`);
+        console.log(`[boot] pharmacy ${row.id} (${row.pharmacy_name}): Supabase key OK (${role}, via ${source}).`);
       }
     }
   } catch (e) {

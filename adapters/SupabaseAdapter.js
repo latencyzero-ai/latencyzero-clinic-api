@@ -9,6 +9,7 @@
 //            image_url, requires_prescription
 //
 // orders   : id TEXT ('OCP-XXXXXX'), customer_name, customer_phone,
+//            customer_address TEXT NOT NULL,
 //            total_amount NUMERIC, status TEXT ('pending'),
 //            items JSONB {
 //              cart         : [{product_id, name, price, quantity}],
@@ -86,8 +87,11 @@ function supabaseError(method, error) {
 
 // Decodes a Supabase JWT payload WITHOUT verifying the signature — just enough
 // to read the "role" claim ('service_role' vs 'anon'). Never logs the key.
-// Returns null when the value is not a decodable JWT.
+// New-style Supabase secret keys (sb_secret_...) are not JWTs but carry full
+// service-level access — reported as 'sb_secret'. Returns null when the value
+// is neither.
 function decodeJwtRole(key) {
+  if (typeof key === 'string' && key.startsWith('sb_secret_')) return 'sb_secret';
   try {
     const payload = JSON.parse(
       Buffer.from(key.split('.')[1], 'base64url').toString('utf8')
@@ -96,6 +100,11 @@ function decodeJwtRole(key) {
   } catch {
     return null;
   }
+}
+
+// True when the key grants service-level (RLS-bypassing) access.
+function isServiceLevel(role) {
+  return role === 'service_role' || role === 'sb_secret';
 }
 
 class SupabaseAdapter extends BaseAdapter {
@@ -129,7 +138,7 @@ class SupabaseAdapter extends BaseAdapter {
     // malformed value) configured where the service_role key belongs. Writes
     // would then silently hit RLS. Logs the role claim only — never the key.
     const role = decodeJwtRole(serviceKey);
-    if (role !== 'service_role') {
+    if (!isServiceLevel(role)) {
       console.error(
         `[SupabaseAdapter] WARNING: resolved Supabase key has role "${role}" — NOT service_role. ` +
         `Writes (orders, stock, prescriptions) will fail under RLS. Check the key configured on Render.`
@@ -301,15 +310,23 @@ class SupabaseAdapter extends BaseAdapter {
     for (let attempt = 0; attempt < 5; attempt++) {
       const orderId = `OCP-${Math.floor(100000 + Math.random() * 900000)}`;
 
+      // customer_address is NOT NULL in Ochesta's schema — always write a value,
+      // even for pickup orders where no delivery address was collected.
+      const customerAddress =
+        orderObj.delivery_address ||
+        orderObj.delivery_area ||
+        (orderObj.fulfilment === 'PICKUP' ? 'PICKUP — collect in store' : 'Not provided');
+
       const { data, error } = await this._client
         .from('orders')
         .insert({
-          id             : orderId,
-          customer_name  : orderObj.customer_name  || null,
-          customer_phone : orderObj.customer_phone || null,
-          total_amount   : orderObj.total,
-          status         : 'pending',
-          items          : itemsPayload,
+          id               : orderId,
+          customer_name    : orderObj.customer_name  || null,
+          customer_phone   : orderObj.customer_phone || null,
+          customer_address : customerAddress,
+          total_amount     : orderObj.total,
+          status           : 'pending',
+          items            : itemsPayload,
         })
         .select('id')
         .single();
@@ -377,4 +394,4 @@ class SupabaseAdapter extends BaseAdapter {
   }
 }
 
-module.exports = { SupabaseAdapter, decodeJwtRole };
+module.exports = { SupabaseAdapter, decodeJwtRole, isServiceLevel };
