@@ -317,11 +317,14 @@ class SupabaseAdapter extends BaseAdapter {
         orderObj.delivery_area ||
         (orderObj.fulfilment === 'PICKUP' ? 'PICKUP — collect in store' : 'Not provided');
 
+      // customer_name is NOT NULL in Ochesta's schema (like customer_address) —
+      // guest web-chat orders carry no name, so write an explicit marker staff
+      // can recognise instead of letting the insert fail with 23502.
       const { data, error } = await this._client
         .from('orders')
         .insert({
           id               : orderId,
-          customer_name    : orderObj.customer_name  || null,
+          customer_name    : orderObj.customer_name  || 'Guest (web chat)',
           customer_phone   : orderObj.customer_phone || null,
           customer_address : customerAddress,
           total_amount     : orderObj.total,

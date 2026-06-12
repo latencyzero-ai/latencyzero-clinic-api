@@ -695,8 +695,9 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
           const orderObj = {
             customer_id      : externalUserId,
-            customer_phone   : externalUserId,
-            customer_name    : state.customer_name    || null,
+            customer_phone   : identity?.phone || externalUserId,
+            customer_name    : identity?.name  || state.customer_name || state.customer_first_name || null,
+            customer_email   : identity?.email || null,
             items            : state.cart.map(i => ({
               product_id : i.product_id,
               name_snap  : i.name_snap,
