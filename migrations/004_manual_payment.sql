@@ -26,21 +26,16 @@ COMMENT ON COLUMN pharmacy_config.payment_details
   IS 'Provider-specific config. manual: {bank_name, account_name, account_number}. Bank details are public-facing (shown to customers) — never store secrets here.';
 
 -- ─── SEED: OCHESTA ───────────────────────────────────────────
--- ┌──────────────────────────────────────────────────────────┐
--- │ PLACEHOLDERS — FILL IN OCHESTA'S REAL BANK DETAILS BEFORE │
--- │ (or after) RUNNING. The server treats any value containing│
--- │ '<<FILL_ME' as NOT CONFIGURED and will never show it to a │
--- │ customer, so running with placeholders is safe.           │
--- └──────────────────────────────────────────────────────────┘
--- Targets the Ochesta tenant by name; adjust the WHERE clause if
--- the row is named differently (check: SELECT id, pharmacy_name,
--- widget_key FROM pharmacy_config;).
+-- Bank details are public-facing (customers transfer to this
+-- account) — safe to commit. Targets the Ochesta tenant by name;
+-- adjust the WHERE clause if the row is named differently
+-- (check: SELECT id, pharmacy_name, widget_key FROM pharmacy_config;).
 UPDATE pharmacy_config
 SET payment_provider = 'manual',
     payment_details  = jsonb_build_object(
-      'bank_name',      '<<FILL_ME: Ochesta bank name>>',
-      'account_name',   '<<FILL_ME: Ochesta account name>>',
-      'account_number', '<<FILL_ME: Ochesta account number>>'
+      'bank_name',      'GLOBUS BANK',
+      'account_name',   'O''CHESTA PHARMA LTD',
+      'account_number', '1000489343'
     )
 WHERE pharmacy_name ILIKE '%ochesta%'
   AND (payment_details = '{}'::jsonb
