@@ -2438,6 +2438,34 @@ function buildWebActions(state, config) {
   return actions;
 }
 
+// GET /api/web/widget-config?widgetKey=zp_...
+// Public, unauthenticated — returns ONLY public-safe branding data for the
+// widget: { pharmacyName, theme }. theme is the pharmacy_config.theme JSONB
+// (migration 005); the widget merges it over its built-in defaults and must
+// fail soft if this endpoint is unreachable. Never add adapter_config,
+// payment, or any credential fields to this response.
+app.get('/api/web/widget-config', async (req, res) => {
+  try {
+    const { widgetKey } = req.query;
+    if (!widgetKey) return res.status(400).json({ error: 'widgetKey is required.' });
+
+    const config = await resolveByWidgetKey(widgetKey);
+    if (!config || !config.active) return res.status(404).json({ error: 'Unknown pharmacy.' });
+
+    // Drop non-string values and unfilled '<<FILL_ME' seed placeholders so a
+    // half-configured theme can never reach the widget.
+    const theme = {};
+    for (const [k, v] of Object.entries(config.theme || {})) {
+      if (typeof v === 'string' && v.trim() && !v.includes('<<FILL_ME')) theme[k] = v.trim();
+    }
+
+    res.json({ pharmacyName: config.pharmacy_name, theme });
+  } catch (e) {
+    addLog('error', 'GET /api/web/widget-config', e.message);
+    res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
 // POST /api/web/message
 // multipart/form-data: { widgetKey, conversationId?, identityToken?, intent?, text, attachment? }
 // Returns: { conversationId, reply, actions }

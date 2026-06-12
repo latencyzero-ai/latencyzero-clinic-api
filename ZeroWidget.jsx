@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import {
   Send,
   Paperclip,
@@ -25,14 +25,29 @@ import {
  * widgetKey      string   required  — zp_... key from onboard-pharmacy.js
  * apiUrl         string   required  — Zero Pharmacy server URL, no trailing slash
  * pharmacyName   string   optional  — display name in the widget header
+ *                                     (server value from widget-config wins when
+ *                                     this prop is omitted)
  * supabaseClient object   optional  — @supabase/supabase-js client
  *                                     When provided, the current user's JWT is
  *                                     attached so Zero can personalise the greeting
  *                                     and offer reorders for logged-in users.
  *                                     Omit for guest-only sites.
  *
- * Network contract (all traffic through one function)
- * ────────────────────────────────────────────────────
+ * Theming (per tenant — never a code fork)
+ * ────────────────────────────────────────
+ * On mount the widget fetches GET /api/web/widget-config?widgetKey=... and
+ * merges the tenant's theme JSONB (pharmacy_config.theme, migration 005) over
+ * DEFAULT_TOKENS. Recognised keys — all optional, missing keys keep defaults:
+ *   accent, ink, surface, canvas, userBubble   → token overrides (any
+ *   DEFAULT_TOKENS key is accepted, e.g. tint, line, accentInk)
+ *   fontFamily        → replaces the default font stack
+ *   logoUrl           → replaces the Zero mark in the launcher and header
+ *   agentDisplayName  → assistant name (header, intro fallback, composer)
+ * FAIL SOFT: if the fetch fails or returns junk, the widget renders with the
+ * built-in defaults — theming must never break the widget.
+ *
+ * Network contract (conversation traffic through one function)
+ * ─────────────────────────────────────────────────────────────
  * callApi(endpoint, data)
  *   sendToZero()       → POST /api/web/message  multipart/form-data
  *                        returns { conversationId, reply, actions }
@@ -55,6 +70,48 @@ const DEFAULTS = {
   supabaseClient : null,
 };
 
+// ── Design tokens (defaults — overridable per tenant via widget-config) ───────
+const DEFAULT_TOKENS = {
+  ink       : "#0F1B2D",
+  inkSoft   : "#33415A",
+  sub       : "#7A869A",
+  line      : "#E7EAF0",
+  surface   : "#FFFFFF",
+  canvas    : "#F4F6F9",
+  tint      : "#F1F4F8",
+  tintHover : "#E7ECF3",
+  userBubble: "#0F1B2D",
+  accent    : "#1F9E8A",
+  accentInk : "#FFFFFF",
+};
+
+const DEFAULT_FONT =
+  '-apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif';
+
+// Merges a tenant theme object over the defaults. Only string values are
+// accepted, and unfilled '<<FILL_ME' seed placeholders are skipped, so a
+// half-configured theme can never break styling.
+function mergeTheme(theme) {
+  const out = {
+    tokens   : { ...DEFAULT_TOKENS },
+    font     : DEFAULT_FONT,
+    logoUrl  : null,
+    agentName: null,
+  };
+  if (!theme || typeof theme !== "object") return out;
+
+  const ok = v => typeof v === "string" && v.trim() && !v.includes("<<FILL_ME");
+
+  for (const key of Object.keys(DEFAULT_TOKENS)) {
+    if (ok(theme[key])) out.tokens[key] = theme[key].trim();
+  }
+  if (ok(theme.fontFamily))       out.font      = theme.fontFamily.trim();
+  if (ok(theme.logoUrl))          out.logoUrl   = theme.logoUrl.trim();
+  if (ok(theme.agentDisplayName)) out.agentName = theme.agentDisplayName.trim();
+
+  return out;
+}
+
 export default function ZeroWidget(props) {
   const cfg = { ...DEFAULTS, ...props };
 
@@ -65,6 +122,17 @@ export default function ZeroWidget(props) {
   const [attach,   setAttach]   = useState(null);
   const [sending,  setSending]  = useState(false);
   const [menuUsed, setMenuUsed] = useState(false);
+
+  // Tenant branding — starts as defaults, replaced by widget-config on mount.
+  const [brand, setBrand] = useState(() => ({ ...mergeTheme(null), pharmacyName: null }));
+
+  const T            = brand.tokens;
+  const agentName    = brand.agentName || "Zero";
+  const pharmacyName = props.pharmacyName || brand.pharmacyName || cfg.pharmacyName;
+
+  // Styles are derived from the state-held tokens, so a theme arriving after
+  // mount restyles the whole widget in one render.
+  const S = useMemo(() => makeStyles(T, brand.font), [T, brand.font]);
 
   const sessionId  = useRef(null);
   const scrollRef  = useRef(null);
@@ -78,6 +146,30 @@ export default function ZeroWidget(props) {
       if (stored) sessionId.current = stored;
     } catch {}
   }, [cfg.widgetKey]);
+
+  // ── Tenant theme: fetch widget-config on mount ────────────────────────────
+  // FAIL SOFT by design — any error leaves the defaults in place.
+  useEffect(() => {
+    if (!cfg.widgetKey || !cfg.apiUrl) return;
+    let live = true;
+    (async () => {
+      try {
+        const res = await fetch(
+          `${cfg.apiUrl}/api/web/widget-config?widgetKey=${encodeURIComponent(cfg.widgetKey)}`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!live || !data || typeof data !== "object") return;
+        setBrand({
+          ...mergeTheme(data.theme),
+          pharmacyName: typeof data.pharmacyName === "string" ? data.pharmacyName : null,
+        });
+      } catch {
+        /* fail soft — keep defaults */
+      }
+    })();
+    return () => { live = false; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps — mount-only
 
   // ── Scroll to bottom ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -178,11 +270,13 @@ export default function ZeroWidget(props) {
   // Sends "Hi" so the server returns the welcome message (personalised if the
   // user is logged in via Supabase). Strips the numbered menu from the reply
   // since the component renders its own interactive menu buttons.
-  // Falls back to a static greeting if the API is not configured.
+  // Falls back to a static greeting if the API is not configured. The fallback
+  // intro is marked rather than baked in as text, so it picks up the tenant's
+  // agentDisplayName even if widget-config resolves after this effect.
   useEffect(() => {
     if (!cfg.widgetKey || !cfg.apiUrl) {
       setMessages([
-        { role: "agent", type: "intro", text: `Hi, I'm Zero, your AI agent for ${cfg.pharmacyName}.` },
+        { role: "agent", type: "intro", fallbackIntro: true },
         { role: "agent", type: "menu" },
       ]);
       return;
@@ -216,7 +310,7 @@ export default function ZeroWidget(props) {
       } catch {
         if (!live) return;
         setMessages([
-          { role: "agent", type: "intro", text: `Hi, I'm Zero, your AI agent for ${cfg.pharmacyName}.` },
+          { role: "agent", type: "intro", fallbackIntro: true },
           { role: "agent", type: "menu" },
         ]);
       }
@@ -277,13 +371,20 @@ export default function ZeroWidget(props) {
     e.target.value = "";
   };
 
+  // ── Brand mark: tenant logo when configured, Zero mark otherwise ──────────
+  const brandMark = (size) =>
+    brand.logoUrl
+      ? <img src={brand.logoUrl} alt="" aria-hidden width={size} height={size}
+             style={{ width: size, height: size, borderRadius: "28%", objectFit: "cover", display: "block" }} />
+      : <ZeroMark size={size} t={T} />;
+
   // ── Launcher (collapsed) ──────────────────────────────────────────────────
   if (!open) {
     return (
       <div style={S.root}>
         <style>{KEYFRAMES}</style>
-        <button aria-label="Chat with Zero" onClick={() => setOpen(true)} style={S.launcher}>
-          <ZeroMark size={26} />
+        <button aria-label={`Chat with ${agentName}`} onClick={() => setOpen(true)} style={S.launcher}>
+          {brandMark(26)}
         </button>
       </div>
     );
@@ -298,31 +399,32 @@ export default function ZeroWidget(props) {
   return (
     <div style={S.root}>
       <style>{KEYFRAMES}</style>
-      <div style={panelStyle} role="dialog" aria-label={`Chat with Zero, ${cfg.pharmacyName}`}>
+      <div style={panelStyle} role="dialog" aria-label={`Chat with ${agentName}, ${pharmacyName}`}>
 
         {/* Header */}
         <div style={S.header}>
           <div style={S.headerLeft}>
             <div style={S.avatar}>
-              <ZeroMark size={20} />
+              {brandMark(20)}
               <span style={S.presence} />
             </div>
             <div>
-              <div style={S.headerName}>Zero</div>
-              <div style={S.headerSub}>{cfg.pharmacyName}</div>
+              <div style={S.headerName}>{agentName}</div>
+              <div style={S.headerSub}>{pharmacyName}</div>
             </div>
           </div>
           <div style={S.headerActions}>
-            <IconBtn label="Talk to a person" onClick={() => requestHumanAgent()}>
+            <IconBtn label="Talk to a person" onClick={() => requestHumanAgent()} S={S} T={T}>
               <Headset size={18} />
             </IconBtn>
             <IconBtn
               label={expanded ? "Shrink" : "Expand"}
               onClick={() => setExpanded(v => !v)}
+              S={S} T={T}
             >
               {expanded ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
             </IconBtn>
-            <IconBtn label="Minimize" onClick={() => setOpen(false)}>
+            <IconBtn label="Minimize" onClick={() => setOpen(false)} S={S} T={T}>
               <Minus size={18} />
             </IconBtn>
           </div>
@@ -348,8 +450,8 @@ export default function ZeroWidget(props) {
                           style={S.menuItem}
                           disabled={menuUsed}
                           onClick={() => handleMenu(item)}
-                          onMouseEnter={e => !menuUsed && (e.currentTarget.style.background = TOKENS.tintHover)}
-                          onMouseLeave={e => (e.currentTarget.style.background = TOKENS.tint)}
+                          onMouseEnter={e => !menuUsed && (e.currentTarget.style.background = T.tintHover)}
+                          onMouseLeave={e => (e.currentTarget.style.background = T.tint)}
                         >
                           <span style={S.menuIcon}><item.Icon size={17} /></span>
                           <span style={S.menuText}>
@@ -365,6 +467,9 @@ export default function ZeroWidget(props) {
             }
 
             const isUser = m.role === "user";
+            const text   = m.fallbackIntro
+              ? `Hi, I'm ${agentName}, your AI agent for ${pharmacyName}.`
+              : m.text;
             return (
               <div key={i} style={isUser ? S.bubbleUserWrap : S.bubbleAgentWrap}>
                 <div style={{ ...S.bubble, ...(isUser ? S.bubbleUser : S.bubbleAgent) }}>
@@ -374,7 +479,7 @@ export default function ZeroWidget(props) {
                       {m.fileName ?? "Attachment"}
                     </span>
                   )}
-                  {m.text}
+                  {text}
                 </div>
               </div>
             );
@@ -417,6 +522,7 @@ export default function ZeroWidget(props) {
             label="Attach prescription or image"
             onClick={() => fileRef.current?.click()}
             tone="muted"
+            S={S} T={T}
           >
             <Paperclip size={19} />
           </IconBtn>
@@ -426,7 +532,7 @@ export default function ZeroWidget(props) {
             value={draft}
             onChange={e => setDraft(e.target.value)}
             onKeyDown={handleKey}
-            placeholder="Message Zero…"
+            placeholder={`Message ${agentName}…`}
             style={S.input}
           />
           <button
@@ -447,14 +553,14 @@ export default function ZeroWidget(props) {
   );
 }
 
-// ── Brand mark ────────────────────────────────────────────────────────────────
-function ZeroMark({ size = 24 }) {
+// ── Brand mark (default — replaced by theme.logoUrl when configured) ──────────
+function ZeroMark({ size = 24, t = DEFAULT_TOKENS }) {
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden>
-      <rect width="32" height="32" rx="9" fill={TOKENS.ink} />
+      <rect width="32" height="32" rx="9" fill={t.ink} />
       <path
         d="M11 11h10l-9.5 10H21"
-        stroke={TOKENS.accent}
+        stroke={t.accent}
         strokeWidth="2.4"
         strokeLinecap="round"
         strokeLinejoin="round"
@@ -463,7 +569,7 @@ function ZeroMark({ size = 24 }) {
   );
 }
 
-function IconBtn({ children, label, onClick, tone }) {
+function IconBtn({ children, label, onClick, tone, S, T }) {
   const [hover, setHover] = useState(false);
   return (
     <button
@@ -474,8 +580,8 @@ function IconBtn({ children, label, onClick, tone }) {
       onMouseLeave={() => setHover(false)}
       style={{
         ...S.iconBtn,
-        color     : tone === "muted" ? TOKENS.sub : TOKENS.inkSoft,
-        background: hover ? TOKENS.tint : "transparent",
+        color     : tone === "muted" ? T.sub : T.inkSoft,
+        background: hover ? T.tint : "transparent",
       }}
     >
       {children}
@@ -483,233 +589,219 @@ function IconBtn({ children, label, onClick, tone }) {
   );
 }
 
-// ── Design tokens ─────────────────────────────────────────────────────────────
-const TOKENS = {
-  ink       : "#0F1B2D",
-  inkSoft   : "#33415A",
-  sub       : "#7A869A",
-  line      : "#E7EAF0",
-  surface   : "#FFFFFF",
-  canvas    : "#F4F6F9",
-  tint      : "#F1F4F8",
-  tintHover : "#E7ECF3",
-  userBubble: "#0F1B2D",
-  accent    : "#1F9E8A",
-  accentInk : "#FFFFFF",
-};
-
-const FONT =
-  '-apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif';
-
-const S = {
-  root: {
-    position  : "fixed",
-    right     : 16,
-    bottom    : 16,
-    zIndex    : 2147483000,
-    fontFamily: FONT,
-  },
-  launcher: {
-    width       : 58,
-    height      : 58,
-    borderRadius: "50%",
-    border      : "none",
-    background  : TOKENS.surface,
-    boxShadow   : "0 8px 30px rgba(15,27,45,0.22)",
-    display     : "grid",
-    placeItems  : "center",
-    cursor      : "pointer",
-    transition  : "transform 140ms ease",
-  },
-  panel: {
-    display       : "flex",
-    flexDirection : "column",
-    background    : TOKENS.surface,
-    borderRadius  : 18,
-    border        : `1px solid ${TOKENS.line}`,
-    boxShadow     : "0 18px 60px rgba(15,27,45,0.26)",
-    overflow      : "hidden",
-    animation     : "zeroIn 180ms cubic-bezier(.2,.7,.3,1)",
-  },
-  header: {
-    display        : "flex",
-    alignItems     : "center",
-    justifyContent : "space-between",
-    padding        : "12px 12px 12px 14px",
-    borderBottom   : `1px solid ${TOKENS.line}`,
-    background     : TOKENS.surface,
-  },
-  headerLeft   : { display: "flex", alignItems: "center", gap: 10 },
-  avatar       : { position: "relative", width: 34, height: 34, display: "grid", placeItems: "center" },
-  presence     : {
-    position    : "absolute",
-    right       : -1,
-    bottom      : -1,
-    width       : 10,
-    height      : 10,
-    borderRadius: "50%",
-    background  : TOKENS.accent,
-    border      : `2px solid ${TOKENS.surface}`,
-  },
-  headerName   : { fontSize: 15, fontWeight: 650, color: TOKENS.ink, lineHeight: 1.1 },
-  headerSub    : { fontSize: 12, color: TOKENS.sub, marginTop: 2 },
-  headerActions: { display: "flex", alignItems: "center", gap: 2 },
-  iconBtn: {
-    width       : 32,
-    height      : 32,
-    border      : "none",
-    borderRadius: 9,
-    display     : "grid",
-    placeItems  : "center",
-    cursor      : "pointer",
-    transition  : "background 120ms ease",
-  },
-  notice: {
-    fontSize    : 11.5,
-    lineHeight  : 1.4,
-    color       : TOKENS.sub,
-    textAlign   : "center",
-    padding     : "9px 18px",
-    background  : TOKENS.canvas,
-    borderBottom: `1px solid ${TOKENS.line}`,
-  },
-  scroll: {
-    flex         : 1,
-    overflowY    : "auto",
-    padding      : "16px 14px",
-    background   : TOKENS.canvas,
-    display      : "flex",
-    flexDirection: "column",
-    gap          : 8,
-  },
-  bubbleAgentWrap: { display: "flex", justifyContent: "flex-start"  },
-  bubbleUserWrap : { display: "flex", justifyContent: "flex-end"    },
-  bubble: {
-    maxWidth  : "82%",
-    padding   : "10px 13px",
-    fontSize  : 14.5,
-    lineHeight: 1.45,
-    borderRadius: 16,
-    whiteSpace: "pre-wrap",
-    wordBreak : "break-word",
-  },
-  bubbleAgent: {
-    background          : TOKENS.surface,
-    color               : TOKENS.ink,
-    border              : `1px solid ${TOKENS.line}`,
-    borderBottomLeftRadius: 5,
-  },
-  bubbleUser: {
-    background             : TOKENS.userBubble,
-    color                  : "#fff",
-    borderBottomRightRadius: 5,
-  },
-  menuTitle: { fontSize: 14.5, fontWeight: 600, color: TOKENS.ink, marginBottom: 9 },
-  menuList : { display: "flex", flexDirection: "column", gap: 7 },
-  menuItem : {
-    display    : "flex",
-    alignItems : "center",
-    gap        : 11,
-    width      : "100%",
-    textAlign  : "left",
-    padding    : "9px 11px",
-    borderRadius: 11,
-    border     : `1px solid ${TOKENS.line}`,
-    background : TOKENS.tint,
-    cursor     : "pointer",
-    transition : "background 120ms ease",
-  },
-  menuIcon: {
-    width       : 30,
-    height      : 30,
-    borderRadius: 8,
-    display     : "grid",
-    placeItems  : "center",
-    background  : TOKENS.surface,
-    color       : TOKENS.accent,
-    border      : `1px solid ${TOKENS.line}`,
-    flexShrink  : 0,
-  },
-  menuText : { display: "flex", flexDirection: "column", gap: 1 },
-  menuLabel: { fontSize: 14, fontWeight: 550, color: TOKENS.ink },
-  menuSub  : { fontSize: 12, color: TOKENS.sub },
-  fileChip : {
-    display    : "inline-flex",
-    alignItems : "center",
-    gap        : 5,
-    fontSize   : 12.5,
-    fontWeight : 500,
-    padding    : "3px 8px",
-    borderRadius: 8,
-    background : "rgba(255,255,255,0.16)",
-    marginBottom: 6,
-  },
-  typing: { display: "inline-flex", gap: 4, alignItems: "center", padding: "13px 14px" },
-  dot   : {
-    width       : 7,
-    height      : 7,
-    borderRadius: "50%",
-    background  : TOKENS.sub,
-    display     : "inline-block",
-    animation   : "zeroBlink 1s infinite ease-in-out",
-  },
-  attachBar : {
-    display        : "flex",
-    alignItems     : "center",
-    justifyContent : "space-between",
-    gap            : 8,
-    padding        : "8px 12px",
-    borderTop      : `1px solid ${TOKENS.line}`,
-    background     : TOKENS.surface,
-  },
-  attachInfo: { display: "flex", alignItems: "center", gap: 7, color: TOKENS.inkSoft, minWidth: 0 },
-  attachName: { fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  attachX   : {
-    border      : "none",
-    background  : TOKENS.tint,
-    borderRadius: 7,
-    width       : 26,
-    height      : 26,
-    display     : "grid",
-    placeItems  : "center",
-    cursor      : "pointer",
-    color       : TOKENS.sub,
-    flexShrink  : 0,
-  },
-  composer: {
-    display    : "flex",
-    alignItems : "flex-end",
-    gap        : 6,
-    padding    : 10,
-    borderTop  : `1px solid ${TOKENS.line}`,
-    background : TOKENS.surface,
-  },
-  input: {
-    flex      : 1,
-    resize    : "none",
-    border    : "none",
-    outline   : "none",
-    fontFamily: FONT,
-    fontSize  : 14.5,
-    lineHeight: 1.4,
-    color     : TOKENS.ink,
-    background: "transparent",
-    maxHeight : 120,
-    padding   : "8px 4px",
-  },
-  sendBtn: {
-    width       : 38,
-    height      : 38,
-    borderRadius: 11,
-    border      : "none",
-    background  : TOKENS.accent,
-    color       : TOKENS.accentInk,
-    display     : "grid",
-    placeItems  : "center",
-    flexShrink  : 0,
-    transition  : "opacity 120ms ease",
-  },
-};
+// ── Style factory ─────────────────────────────────────────────────────────────
+// Built from the state-held tokens so per-tenant themes restyle everything.
+function makeStyles(T, font) {
+  return {
+    root: {
+      position  : "fixed",
+      right     : 16,
+      bottom    : 16,
+      zIndex    : 2147483000,
+      fontFamily: font,
+    },
+    launcher: {
+      width       : 58,
+      height      : 58,
+      borderRadius: "50%",
+      border      : "none",
+      background  : T.surface,
+      boxShadow   : "0 8px 30px rgba(15,27,45,0.22)",
+      display     : "grid",
+      placeItems  : "center",
+      cursor      : "pointer",
+      transition  : "transform 140ms ease",
+    },
+    panel: {
+      display       : "flex",
+      flexDirection : "column",
+      background    : T.surface,
+      borderRadius  : 18,
+      border        : `1px solid ${T.line}`,
+      boxShadow     : "0 18px 60px rgba(15,27,45,0.26)",
+      overflow      : "hidden",
+      animation     : "zeroIn 180ms cubic-bezier(.2,.7,.3,1)",
+    },
+    header: {
+      display        : "flex",
+      alignItems     : "center",
+      justifyContent : "space-between",
+      padding        : "12px 12px 12px 14px",
+      borderBottom   : `1px solid ${T.line}`,
+      background     : T.surface,
+    },
+    headerLeft   : { display: "flex", alignItems: "center", gap: 10 },
+    avatar       : { position: "relative", width: 34, height: 34, display: "grid", placeItems: "center" },
+    presence     : {
+      position    : "absolute",
+      right       : -1,
+      bottom      : -1,
+      width       : 10,
+      height      : 10,
+      borderRadius: "50%",
+      background  : T.accent,
+      border      : `2px solid ${T.surface}`,
+    },
+    headerName   : { fontSize: 15, fontWeight: 650, color: T.ink, lineHeight: 1.1 },
+    headerSub    : { fontSize: 12, color: T.sub, marginTop: 2 },
+    headerActions: { display: "flex", alignItems: "center", gap: 2 },
+    iconBtn: {
+      width       : 32,
+      height      : 32,
+      border      : "none",
+      borderRadius: 9,
+      display     : "grid",
+      placeItems  : "center",
+      cursor      : "pointer",
+      transition  : "background 120ms ease",
+    },
+    notice: {
+      fontSize    : 11.5,
+      lineHeight  : 1.4,
+      color       : T.sub,
+      textAlign   : "center",
+      padding     : "9px 18px",
+      background  : T.canvas,
+      borderBottom: `1px solid ${T.line}`,
+    },
+    scroll: {
+      flex         : 1,
+      overflowY    : "auto",
+      padding      : "16px 14px",
+      background   : T.canvas,
+      display      : "flex",
+      flexDirection: "column",
+      gap          : 8,
+    },
+    bubbleAgentWrap: { display: "flex", justifyContent: "flex-start"  },
+    bubbleUserWrap : { display: "flex", justifyContent: "flex-end"    },
+    bubble: {
+      maxWidth  : "82%",
+      padding   : "10px 13px",
+      fontSize  : 14.5,
+      lineHeight: 1.45,
+      borderRadius: 16,
+      whiteSpace: "pre-wrap",
+      wordBreak : "break-word",
+    },
+    bubbleAgent: {
+      background          : T.surface,
+      color               : T.ink,
+      border              : `1px solid ${T.line}`,
+      borderBottomLeftRadius: 5,
+    },
+    bubbleUser: {
+      background             : T.userBubble,
+      color                  : "#fff",
+      borderBottomRightRadius: 5,
+    },
+    menuTitle: { fontSize: 14.5, fontWeight: 600, color: T.ink, marginBottom: 9 },
+    menuList : { display: "flex", flexDirection: "column", gap: 7 },
+    menuItem : {
+      display    : "flex",
+      alignItems : "center",
+      gap        : 11,
+      width      : "100%",
+      textAlign  : "left",
+      padding    : "9px 11px",
+      borderRadius: 11,
+      border     : `1px solid ${T.line}`,
+      background : T.tint,
+      cursor     : "pointer",
+      transition : "background 120ms ease",
+    },
+    menuIcon: {
+      width       : 30,
+      height      : 30,
+      borderRadius: 8,
+      display     : "grid",
+      placeItems  : "center",
+      background  : T.surface,
+      color       : T.accent,
+      border      : `1px solid ${T.line}`,
+      flexShrink  : 0,
+    },
+    menuText : { display: "flex", flexDirection: "column", gap: 1 },
+    menuLabel: { fontSize: 14, fontWeight: 550, color: T.ink },
+    menuSub  : { fontSize: 12, color: T.sub },
+    fileChip : {
+      display    : "inline-flex",
+      alignItems : "center",
+      gap        : 5,
+      fontSize   : 12.5,
+      fontWeight : 500,
+      padding    : "3px 8px",
+      borderRadius: 8,
+      background : "rgba(255,255,255,0.16)",
+      marginBottom: 6,
+    },
+    typing: { display: "inline-flex", gap: 4, alignItems: "center", padding: "13px 14px" },
+    dot   : {
+      width       : 7,
+      height      : 7,
+      borderRadius: "50%",
+      background  : T.sub,
+      display     : "inline-block",
+      animation   : "zeroBlink 1s infinite ease-in-out",
+    },
+    attachBar : {
+      display        : "flex",
+      alignItems     : "center",
+      justifyContent : "space-between",
+      gap            : 8,
+      padding        : "8px 12px",
+      borderTop      : `1px solid ${T.line}`,
+      background     : T.surface,
+    },
+    attachInfo: { display: "flex", alignItems: "center", gap: 7, color: T.inkSoft, minWidth: 0 },
+    attachName: { fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+    attachX   : {
+      border      : "none",
+      background  : T.tint,
+      borderRadius: 7,
+      width       : 26,
+      height      : 26,
+      display     : "grid",
+      placeItems  : "center",
+      cursor      : "pointer",
+      color       : T.sub,
+      flexShrink  : 0,
+    },
+    composer: {
+      display    : "flex",
+      alignItems : "flex-end",
+      gap        : 6,
+      padding    : 10,
+      borderTop  : `1px solid ${T.line}`,
+      background : T.surface,
+    },
+    input: {
+      flex      : 1,
+      resize    : "none",
+      border    : "none",
+      outline   : "none",
+      fontFamily: font,
+      fontSize  : 14.5,
+      lineHeight: 1.4,
+      color     : T.ink,
+      background: "transparent",
+      maxHeight : 120,
+      padding   : "8px 4px",
+    },
+    sendBtn: {
+      width       : 38,
+      height      : 38,
+      borderRadius: 11,
+      border      : "none",
+      background  : T.accent,
+      color       : T.accentInk,
+      display     : "grid",
+      placeItems  : "center",
+      flexShrink  : 0,
+      transition  : "opacity 120ms ease",
+    },
+  };
+}
 
 const KEYFRAMES = `
 @keyframes zeroIn    { from { opacity:0; transform:translateY(12px) scale(.98); } to { opacity:1; transform:none; } }
