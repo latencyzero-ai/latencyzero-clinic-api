@@ -73,6 +73,16 @@ class NativeAdapter extends BaseAdapter {
     throw new Error('NativeAdapter: markOrderPaid() not yet implemented.');
   }
 
+  async incrementStock(_items) {
+    // TODO: UPDATE products SET stock_qty = stock_qty + $qty per item
+    throw new Error('NativeAdapter: incrementStock() not yet implemented.');
+  }
+
+  async deleteOrder(_orderId) {
+    // TODO: DELETE FROM orders WHERE id = $1 AND pharmacy_id = $2
+    throw new Error('NativeAdapter: deleteOrder() not yet implemented.');
+  }
+
   async getCustomerOrders(_externalUserId) {
     // TODO: SELECT orders + order_items WHERE customer_id = $1 AND pharmacy_id = $2
     throw new Error('NativeAdapter: getCustomerOrders() not yet implemented.');

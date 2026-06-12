@@ -127,6 +127,26 @@ class BaseAdapter {
     throw new Error(`${this.constructor.name}: markOrderPaid() not implemented.`);
   }
 
+  // Add stock back for the given items — the reverse of decrementStock().
+  // Used by staff tools when deleting/cancelling an order whose stock was
+  // already decremented at creation (v1 timing). Need not be atomic.
+  //
+  // items : Array<{ product_id: string | number, qty: number }>
+  // →     : void
+  async incrementStock(items) { // eslint-disable-line no-unused-vars
+    throw new Error(`${this.constructor.name}: incrementStock() not implemented.`);
+  }
+
+  // Permanently delete an order from the client backend. Staff/admin tool
+  // only (test orders, junk, cancelled-unpaid cleanup) — never called from
+  // the customer conversation flow.
+  //
+  // orderId : string | number
+  // →       : { deleted: boolean } — false when no such order existed
+  async deleteOrder(orderId) { // eslint-disable-line no-unused-vars
+    throw new Error(`${this.constructor.name}: deleteOrder() not implemented.`);
+  }
+
   // ── ORDER HISTORY ─────────────────────────────────────────────────────────
 
   // Return recent orders for a customer. Used for the "track order" intent

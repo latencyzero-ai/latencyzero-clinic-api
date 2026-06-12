@@ -457,6 +457,39 @@ class SupabaseAdapter extends BaseAdapter {
     return { ok: true, order: data };
   }
 
+  // Adds stock back for the given items — reverse of decrementStock(). Used
+  // by staff tools when deleting/cancelling an order whose stock was already
+  // decremented at creation (v1 timing). Per-item read-then-update; not
+  // atomic, which is acceptable for a low-contention admin action.
+  //
+  // items : Array<{ product_id: string | number, qty: number }>
+  async incrementStock(items) {
+    for (const item of items) {
+      const current = await this.checkStock(item.product_id);
+      const { error } = await this._client
+        .from('products')
+        .update({ stock_qty: current + Number(item.qty || 0) })
+        .eq('id', item.product_id);
+
+      if (error) {
+        throw supabaseError(`incrementStock (product ${item.product_id})`, error);
+      }
+    }
+  }
+
+  // Permanently deletes an order row. Staff/admin tool only — never called
+  // from the customer conversation flow.
+  async deleteOrder(orderId) {
+    const { data, error } = await this._client
+      .from('orders')
+      .delete()
+      .eq('id', orderId)
+      .select('id');
+
+    if (error) throw supabaseError('deleteOrder', error);
+    return { deleted: (data || []).length > 0 };
+  }
+
   // ── ORDER HISTORY ─────────────────────────────────────────────────────────
 
   // Returns the 20 most recent orders for a customer.

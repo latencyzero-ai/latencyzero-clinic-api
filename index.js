@@ -2614,6 +2614,48 @@ app.post('/api/pharmacy/:widgetKey/orders/:orderId/confirm-payment', adminAuth, 
   }
 });
 
+// ─── PHARMACY (ADAPTER): DELETE ORDER ─────────────────
+// DELETE /api/pharmacy/:widgetKey/orders/:orderId?restock=true
+// Headers: x-admin-token
+//
+// Staff/admin tool: permanently removes an order from the client backend —
+// test orders, junk, or cancelling an unpaid order that's holding stock.
+// With ?restock=true, each cart item's quantity is added back to stock first
+// (v1 decrements stock at order creation, so deleting an order without
+// restocking loses that stock).
+app.delete('/api/pharmacy/:widgetKey/orders/:orderId', adminAuth, async (req, res) => {
+  try {
+    const { widgetKey, orderId } = req.params;
+
+    const config = await resolveByWidgetKey(widgetKey);
+    if (!config) return res.status(404).json({ error: 'Unknown pharmacy.' });
+
+    const adapter = loadAdapter(config, pool);
+
+    const order = await adapter.getOrder(orderId);
+    if (!order) return res.status(404).json({ error: `Order ${orderId} not found.` });
+
+    let restocked = [];
+    if (String(req.query.restock) === 'true') {
+      // Ochesta cart items use {product_id, quantity}; the interface shape uses qty
+      const items = (order.items?.cart || [])
+        .map(i => ({ product_id: i.product_id, qty: Number(i.quantity || i.qty || 0) }))
+        .filter(i => i.product_id && i.qty > 0);
+      await adapter.incrementStock(items);
+      restocked = items;
+    }
+
+    await adapter.deleteOrder(orderId);
+
+    io.emit('queue_updated', { type: 'pharmacy_order_deleted', orderId, pharmacyId: config.id });
+    addLog('info', `Order deleted: ${orderId} | ${config.pharmacy_name} | restocked ${restocked.length} item(s)`);
+    res.json({ success: true, deleted: orderId, status_at_deletion: order.status, restocked });
+  } catch (e) {
+    addLog('error', 'delete order (adapter) error', e.message);
+    res.status(500).json({ error: 'Failed to delete order.' });
+  }
+});
+
 // ─── HOSTED WIDGET SCRIPT ─────────────────────────────
 app.get('/widget/:widgetKey.js', async (req, res) => {
   try {
