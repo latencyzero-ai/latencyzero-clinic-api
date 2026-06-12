@@ -376,6 +376,84 @@ class SupabaseAdapter extends BaseAdapter {
     }
   }
 
+  // ── ORDER LOOKUP ──────────────────────────────────────────────────────────
+
+  // Fetches a single Ochesta order by its 'OCP-XXXXXX' ID. Returns null when
+  // the order doesn't exist.
+  async getOrder(orderId) {
+    const { data, error } = await this._client
+      .from('orders')
+      .select('*')
+      .eq('id', orderId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return null; // no row
+      throw supabaseError('getOrder', error);
+    }
+    return data;
+  }
+
+  // ── MANUAL PAYMENT CONFIRMATION ───────────────────────────────────────────
+
+  // Marks an order 'paid' after pharmacy staff have verified the bank transfer
+  // against their account. Ochesta's status vocabulary is lowercase:
+  // 'pending' → 'paid'.
+  //
+  // paid_at stamping: the timestamp (and optional staff payment_ref) is always
+  // merged into the items JSONB so it survives regardless of schema; the
+  // update also tries Ochesta's top-level paid_at column, and falls back to
+  // JSONB-only when that column doesn't exist (PostgREST PGRST204).
+  //
+  // Idempotent: the update is filtered on status != 'paid', so a double
+  // confirm (or a race between two staff members) changes nothing and is
+  // reported as { ok: false, reason: 'already_paid' }.
+  async markOrderPaid(orderId, { paymentRef = null } = {}) {
+    const existing = await this.getOrder(orderId);
+    if (!existing) return { ok: false, reason: 'not_found' };
+    if (String(existing.status || '').toLowerCase() === 'paid') {
+      return { ok: false, reason: 'already_paid', order: existing };
+    }
+
+    const paidAt = new Date().toISOString();
+    const items  = {
+      ...(existing.items || {}),
+      paid_at     : paidAt,
+      payment_ref : paymentRef || (existing.items || {}).payment_ref || null,
+    };
+
+    // Attempt 1: status + items + top-level paid_at column
+    let { data, error } = await this._client
+      .from('orders')
+      .update({ status: 'paid', paid_at: paidAt, items })
+      .eq('id', orderId)
+      .neq('status', 'paid')
+      .select()
+      .single();
+
+    // PGRST204 = unknown column in the update payload — Ochesta's orders
+    // table has no paid_at column; the JSONB stamp inside items is enough.
+    if (error && error.code === 'PGRST204') {
+      ({ data, error } = await this._client
+        .from('orders')
+        .update({ status: 'paid', items })
+        .eq('id', orderId)
+        .neq('status', 'paid')
+        .select()
+        .single());
+    }
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // Filter matched no row — another confirm won the race.
+        return { ok: false, reason: 'already_paid' };
+      }
+      throw supabaseError('markOrderPaid', error);
+    }
+
+    return { ok: true, order: data };
+  }
+
   // ── ORDER HISTORY ─────────────────────────────────────────────────────────
 
   // Returns the 20 most recent orders for a customer.

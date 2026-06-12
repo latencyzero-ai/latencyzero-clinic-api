@@ -94,6 +94,68 @@ function formatRecentOrders(orders) {
   }).filter(o => o.items.length > 0);
 }
 
+// ─── MANUAL PAYMENT (v1: bank transfer, no gateway) ───────────────────────────
+
+// True when the customer message claims a payment was made ("I've paid",
+// "transfer done", "sent the money"). Checked BEFORE menu keyword routing —
+// "I paid for my order" contains "order" and would otherwise start a new
+// order flow.
+function isPaymentClaim(rawMsg) {
+  const m = (rawMsg || '').toLowerCase();
+  if (/\bpaid\b/.test(m)) return true;
+  if (/\btransferred\b/.test(m)) return true;
+  return /\b(made|sent|done|completed|finished)\b/.test(m) && /\b(payment|transfer)\b/.test(m);
+}
+
+// Builds the bank-transfer instruction block from pharmacy_config
+// (migration 004: payment_details JSONB {bank_name, account_name,
+// account_number}). Returns null when manual payment isn't configured —
+// the caller falls back to "our team will be in touch". Unfilled
+// '<<FILL_ME' seed placeholders count as NOT configured so they are
+// never shown to a customer.
+function buildPaymentInstructions(pharmacyConfig, orderId, total, currency) {
+  if ((pharmacyConfig.payment_provider || 'manual') !== 'manual') return null;
+
+  const pd     = pharmacyConfig.payment_details || {};
+  const filled = v => v && !String(v).includes('<<FILL_ME');
+
+  if (filled(pd.bank_name) && filled(pd.account_name) && filled(pd.account_number)) {
+    return (
+      `Please pay by bank transfer:\n\n` +
+      `Bank: ${pd.bank_name}\n` +
+      `Account name: ${pd.account_name}\n` +
+      `Account number: ${pd.account_number}\n` +
+      `Amount: ${formatCurrency(total, currency)} (please transfer the exact amount)\n\n` +
+      `IMPORTANT: Use your order ID *${orderId}* as the transfer reference/narration so the pharmacy can match your payment.`
+    );
+  }
+
+  // Legacy free-text details (pre-004 manual_payment_details column)
+  if (pharmacyConfig.manual_payment_details) {
+    return (
+      `Please make payment via:\n${pharmacyConfig.manual_payment_details}\n\n` +
+      `Use your order ID *${orderId}* as the transfer reference/narration.`
+    );
+  }
+
+  return null;
+}
+
+// Deterministic reply when a customer says they've paid. Server-side only —
+// NEVER changes order status and NEVER says the payment was received. Only
+// staff confirm transfers, via
+// POST /api/pharmacy/:widgetKey/orders/:orderId/confirm-payment.
+function buildPaymentClaimReply(state, pharmacyConfig) {
+  const orderRef = state.last_order_id ? ` for order *${state.last_order_id}*` : '';
+  let reply =
+    `Thank you for letting us know. The pharmacy team will check their account and verify your transfer${orderRef} shortly — ` +
+    `your order will be processed as soon as they confirm it on their end. I'm not able to confirm payments myself.`;
+  reply += pharmacyConfig.handoff_number
+    ? `\n\nIf it's urgent, you can reach the pharmacy directly on WhatsApp: https://wa.me/${pharmacyConfig.handoff_number.replace(/[^0-9]/g, '')}`
+    : `\n\nIf it's urgent, send us an enquiry and a staff member will assist you.`;
+  return reply;
+}
+
 // ─── FACTORY ──────────────────────────────────────────────────────────────────
 
 function createPharmacyProcessor({ pool, groq, io, addLog, sendWhatsApp, getGreeting, META_API, ACCESS_TOKEN }) {
@@ -213,6 +275,11 @@ TONE RULES:
 - Never ask for the customer phone number.
 - Vary acknowledgement phrases; never repeat the same phrase twice in a row.
 - If the customer asks a medical question: give the one redirect sentence above, nothing else.
+
+PAYMENT RULES (CRITICAL — never break these):
+- Payment is by manual bank transfer, verified by pharmacy STAFF checking their bank account. You cannot see payments.
+- NEVER say or imply that a payment has been received, confirmed, or verified. Never say "payment received", "payment confirmed", or anything equivalent.
+- If the customer says they have paid, transferred, or sent money: thank them, say the pharmacy team will verify the transfer shortly and the order will be processed once they confirm it. Do not change anything else about the order.
 
 INTENT VALUES: order | track | cancel | collecting
 
@@ -457,6 +524,17 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
     // ── DONE → return to MENU ──
     if (state.machine === 'DONE') {
+      // Customer reporting a bank transfer after checkout: acknowledge,
+      // repeat that staff will verify, keep the DONE state. The order status
+      // is NEVER changed from chat.
+      if (isPaymentClaim(msg)) {
+        const reply = buildPaymentClaimReply(state, pharmacyConfig);
+        history.push({ role: 'user', content: message || '(media)', timestamp: now });
+        history.push({ role: 'assistant', content: reply, timestamp: now });
+        await saveConv(externalUserId, pharmacyConfig.id, state, history, 'DONE');
+        return reply;
+      }
+
       const firstName = state.customer_first_name || null;
       const daypart   = getDaypart(pharmacyConfig.timezone);
       const greeting  = firstName ? `${daypart}, ${firstName}.` : `${daypart}.`;
@@ -468,6 +546,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
         machine            : 'MENU',
         recent_orders      : state.recent_orders || [],
         customer_first_name: firstName,
+        last_order_id      : state.last_order_id || null, // kept so a later "I've paid" can reference it
       }, history);
       return welcome;
     }
@@ -475,6 +554,15 @@ Populate extracted fields ONLY when you actually observed them in the customer m
     // ── MENU — detect selection ──
     if (state.machine === 'MENU') {
       history.push({ role: 'user', content: message || '(media)', timestamp: now });
+
+      // Payment claim — checked before keyword routing so "I paid for my
+      // order" never starts a new order flow. No status change from chat.
+      if (isPaymentClaim(msg)) {
+        const reply = buildPaymentClaimReply(state, pharmacyConfig);
+        history.push({ role: 'assistant', content: reply, timestamp: now });
+        await saveConv(externalUserId, pharmacyConfig.id, state, history);
+        return reply;
+      }
 
       let nextPhase = null;
       let intro     = '';
@@ -638,7 +726,12 @@ Populate extracted fields ONLY when you actually observed them in the customer m
             return errReply;
           }
 
-          // Decrement stock — non-blocking; a failure here does not cancel the order
+          // Decrement stock at ORDER CREATION (v1 decision) — non-blocking; a
+          // failure here does not cancel the order. Orders are created
+          // 'pending' and only flip to 'paid' when staff confirm the bank
+          // transfer, so a never-paid order holds stock until staff cancel it.
+          // Moving this decrement to payment confirmation (markOrderPaid) is a
+          // v1.5 decision — do NOT change the timing as part of other fixes.
           adapter.decrementStock(state.cart.map(i => ({ product_id: i.product_id, qty: i.qty })))
             .catch(e => {
               console.error('[pharmacyFlow.decrementStock]', e.message, e.details || '', e.hint || '', e.code || '');
@@ -647,28 +740,35 @@ Populate extracted fields ONLY when you actually observed them in the customer m
             });
 
           const needsRx = state.cart.some(i => i.requires_prescription);
-          let confirmMsg;
 
+          // PAYMENT LANGUAGE RULE (critical): the order is AWAITING PAYMENT
+          // until staff verify the bank transfer and mark it paid. This
+          // message must never say payment was "received" or "confirmed" —
+          // order.status is still 'pending' at this point.
+          const payInstr = buildPaymentInstructions(pharmacyConfig, orderId, total, currency);
+
+          let confirmMsg =
+            `Your order is confirmed and is now awaiting payment.\n\n` +
+            `Order ID: *${orderId}*\nTotal: ${formatCurrency(total, currency)}\n\n`;
           if (needsRx) {
-            confirmMsg =
-              `Your order has been placed.\n\nReference: *${orderId}*\nTotal: ${formatCurrency(total, currency)}\n\n` +
-              `One or more items require a valid prescription. Our pharmacist will review before processing.\n\n` +
-              `Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
-          } else if (pharmacyConfig.manual_payment_details) {
-            confirmMsg =
-              `Your order is confirmed.\n\nReference: *${orderId}*\nTotal: ${formatCurrency(total, currency)}\n\n` +
-              `Please make payment via:\n${pharmacyConfig.manual_payment_details}\n\n` +
-              `Use *${orderId}* as your payment reference.\n\n` +
-              `Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
-          } else {
-            confirmMsg =
-              `Your order is confirmed.\n\nReference: *${orderId}*\nTotal: ${formatCurrency(total, currency)}\n\n` +
-              `Our team will be in touch with payment details shortly.\n\n` +
-              `Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
+            confirmMsg +=
+              `One or more items require a valid prescription. Our pharmacist will review it before processing.\n\n`;
           }
+          confirmMsg += payInstr
+            ? `${payInstr}\n\n` +
+              `Once you've made the transfer, the pharmacy will verify it shortly and start processing your order.\n\n` +
+              `Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`
+            : `Our team will be in touch with payment details shortly.\n\n` +
+              `Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
 
           history.push({ role: 'assistant', content: confirmMsg, timestamp: now });
-          await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || null }, history, 'DONE');
+          await saveConv(externalUserId, pharmacyConfig.id, {
+            machine            : 'DONE',
+            recent_orders      : state.recent_orders || [],
+            customer_first_name: state.customer_first_name || null,
+            last_order_id      : orderId, // referenced if the customer later says "I've paid"
+            last_order_total   : total,
+          }, history, 'DONE');
           io.emit('queue_updated', { type: 'pharmacy_order', orderId, pharmacyId: pharmacyConfig.id, needsRx });
           addLog('info', `Order ${orderId} | ${pharmacyConfig.pharmacy_name} | ${formatCurrency(total, currency)}`);
           return confirmMsg;

@@ -1059,6 +1059,11 @@ async function confirmOrderPayment(orderId, paymentRef, pharmacyId) {
   }
 }
 
+// INVARIANT: this is the only place that tells a customer "Payment received",
+// and it must ONLY ever be called with an order whose status was just flipped
+// to PAID by confirmOrderPayment (Paystack webhook / legacy manual confirm).
+// Never call it on an unpaid order — Zara's chat flow says "awaiting payment"
+// until staff confirm the transfer.
 async function notifyCustomerPaymentConfirmed(order, pharmacy) {
   const currency = pharmacy.currency || 'NGN';
   const ref = `ZPHARM-${order.id}`;
@@ -2554,6 +2559,58 @@ app.post('/api/web/handoff', async (req, res) => {
   } catch (e) {
     addLog('error', 'POST /api/web/handoff', e.message);
     res.status(500).json({ error: 'Something went wrong.' });
+  }
+});
+
+// ─── PHARMACY (ADAPTER): CONFIRM MANUAL PAYMENT ───────
+// POST /api/pharmacy/:widgetKey/orders/:orderId/confirm-payment
+// Headers: x-admin-token   Body (optional): { payment_ref }
+//
+// Staff action for payment_provider='manual' tenants: after checking their
+// bank account for the customer's transfer (narration = order ID, e.g.
+// OCP-XXXXXX), staff call this to flip the order to 'paid' (the client
+// backend's own status vocabulary) and stamp paid_at. This is the ONLY path
+// that marks an order paid — Zara never does it from chat.
+//
+// Goes through the tenant adapter (orders live in the client's backend, e.g.
+// Ochesta's Supabase) — unlike the older /api/pharmacy/orders/:orderId/...
+// routes, which target the internal orders table dropped by migration 003.
+//
+// NOTE (v1): stock was already decremented at order creation; this endpoint
+// does NOT touch stock. Moving the decrement here is a v1.5 decision — see
+// the comment in pharmacyFlow.js.
+app.post('/api/pharmacy/:widgetKey/orders/:orderId/confirm-payment', adminAuth, async (req, res) => {
+  try {
+    const { widgetKey, orderId } = req.params;
+
+    const config = await resolveByWidgetKey(widgetKey);
+    if (!config) return res.status(404).json({ error: 'Unknown pharmacy.' });
+
+    const adapter = loadAdapter(config, pool);
+    const result  = await adapter.markOrderPaid(orderId, { paymentRef: req.body?.payment_ref || null });
+
+    if (!result.ok) {
+      if (result.reason === 'not_found') {
+        return res.status(404).json({ error: `Order ${orderId} not found.` });
+      }
+      return res.status(409).json({ error: `Order ${orderId} is already marked paid.` });
+    }
+
+    io.emit('queue_updated', { type: 'pharmacy_order_paid', orderId, pharmacyId: config.id });
+    addLog('info', `Manual transfer confirmed: ${orderId} | ${config.pharmacy_name}`);
+
+    res.json({
+      success: true,
+      order: {
+        id           : result.order.id,
+        status       : result.order.status,
+        total_amount : result.order.total_amount,
+        paid_at      : result.order.paid_at || result.order.items?.paid_at || null,
+      },
+    });
+  } catch (e) {
+    addLog('error', 'confirm-payment (adapter) error', e.message);
+    res.status(500).json({ error: 'Failed to confirm payment.' });
   }
 });
 

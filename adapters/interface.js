@@ -103,6 +103,30 @@ class BaseAdapter {
     throw new Error(`${this.constructor.name}: decrementStock() not implemented.`);
   }
 
+  // Fetch a single order by its backend ID.
+  // Returns null when no order with that ID exists.
+  //
+  // orderId : string | number
+  // →       : order (backend-specific shape) | null
+  async getOrder(orderId) { // eslint-disable-line no-unused-vars
+    throw new Error(`${this.constructor.name}: getOrder() not implemented.`);
+  }
+
+  // Mark an order as paid after STAFF have verified the payment out-of-band
+  // (v1: a manual bank transfer checked against the pharmacy's bank account).
+  // Must be idempotent: confirming an already-paid order is a no-op reported
+  // via { ok: false, reason: 'already_paid' } — never a double state change.
+  // Status value must match the client backend's own vocabulary
+  // (e.g. Ochesta uses lowercase 'pending' → 'paid').
+  //
+  // orderId : string | number
+  // opts    : { paymentRef?: string|null } — optional staff-supplied reference
+  // →       : { ok: true,  order }                              on success
+  //           { ok: false, reason: 'not_found' | 'already_paid', order? }
+  async markOrderPaid(orderId, opts = {}) { // eslint-disable-line no-unused-vars
+    throw new Error(`${this.constructor.name}: markOrderPaid() not implemented.`);
+  }
+
   // ── ORDER HISTORY ─────────────────────────────────────────────────────────
 
   // Return recent orders for a customer. Used for the "track order" intent

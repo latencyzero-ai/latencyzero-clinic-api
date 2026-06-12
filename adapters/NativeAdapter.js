@@ -62,6 +62,17 @@ class NativeAdapter extends BaseAdapter {
     throw new Error('NativeAdapter: decrementStock() not yet implemented.');
   }
 
+  async getOrder(_orderId) {
+    // TODO: SELECT from orders WHERE id = $1 AND pharmacy_id = $2
+    throw new Error('NativeAdapter: getOrder() not yet implemented.');
+  }
+
+  async markOrderPaid(_orderId, _opts) {
+    // TODO: UPDATE orders SET status = 'paid', paid_at = NOW()
+    // WHERE id = $1 AND pharmacy_id = $2 AND status != 'paid'
+    throw new Error('NativeAdapter: markOrderPaid() not yet implemented.');
+  }
+
   async getCustomerOrders(_externalUserId) {
     // TODO: SELECT orders + order_items WHERE customer_id = $1 AND pharmacy_id = $2
     throw new Error('NativeAdapter: getCustomerOrders() not yet implemented.');
