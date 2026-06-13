@@ -2778,17 +2778,18 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     ._zw-head-btn:hover{opacity:1;background:rgba(255,255,255,.18)}
     ._zw-head-btn svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
     /* tappable menu */
-    ._zw-menu{display:flex;flex-direction:column;gap:10px;width:100%;margin:4px 0 2px}
-    ._zw-menu-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:13px 14px;
+    ._zw-menu{display:flex;flex-direction:column;gap:10px}
+    ._zw-menu-title{font-size:14.5px;font-weight:600;color:${INK};margin-bottom:11px}
+    ._zw-menu-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:12px 14px;
       border-radius:11px;border:1px solid #e7eaf0;background:#f1f4f8;cursor:pointer;transition:background .12s;font-family:inherit}
     ._zw-menu-item:hover:not(:disabled){background:#e7ecf3}
     ._zw-menu-item:disabled{cursor:default;opacity:.55}
     ._zw-menu-ico{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
       background:${SURFACE};color:${ACCENT};border:1px solid #e7eaf0;flex-shrink:0}
     ._zw-menu-ico svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-    ._zw-menu-txt{display:flex;flex-direction:column;gap:3px;min-width:0}
-    ._zw-menu-label{font-size:14px;font-weight:600;line-height:1.3;color:${INK}}
-    ._zw-menu-sub{font-size:12px;line-height:1.3;color:#7a869a}
+    ._zw-menu-txt{display:flex;flex-direction:column;gap:1px}
+    ._zw-menu-label{font-size:14px;font-weight:550;color:${INK}}
+    ._zw-menu-sub{font-size:12px;color:#7a869a}
     /* attachment */
     #_zw-attach{background:none;border:none;color:#7a869a;cursor:pointer;width:38px;height:38px;display:flex;align-items:center;justify-content:center;
       border-radius:8px;flex-shrink:0;transition:background .15s}
@@ -2889,9 +2890,14 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   function renderMenu() {
     if (menuShown) return;
     menuShown = true;
-    // Render as a standalone full-width option list — NOT inside a chat bubble.
-    // A bubble caps width at 78% and adds shadow/padding, which squeezes the
-    // option boxes; full-width cards are the standard quick-reply pattern.
+    // Mirror ZeroWidget.jsx exactly: a chat bubble containing a "How can I
+    // help?" title and the option list.
+    var wrapEl = document.createElement('div');
+    wrapEl.className = '_zw-bubble bot';
+    var title = document.createElement('div');
+    title.className = '_zw-menu-title';
+    title.textContent = 'How can I help?';
+    wrapEl.appendChild(title);
     var list = document.createElement('div');
     list.className = '_zw-menu';
     MENU.forEach(function(it){
@@ -2905,7 +2911,8 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
       b.addEventListener('click', function(){ chooseIntent(it); });
       list.appendChild(b);
     });
-    msgs.appendChild(list);
+    wrapEl.appendChild(list);
+    msgs.appendChild(wrapEl);
     msgs.scrollTop = msgs.scrollHeight;
   }
 
