@@ -2983,12 +2983,21 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     open = !open;
     box.classList.toggle('hide', !open);
     if (open && msgs.children.length === 0) {
-      send.disabled = true;
-      var t = setTyping();
-      sendMsg('Hi')
-        .then(function(d){ t.remove(); bubble(stripMenu(d.reply), 'bot'); renderMenu(); })
-        .catch(function(){ t.remove(); })
-        .finally(function(){ send.disabled = false; });
+      if (sid) {
+        // Returning visitor: the conversation already exists past the START
+        // step, so re-sending 'Hi' would land on the MENU "didn't catch that"
+        // reply and look like an error. Greet locally and show the menu; taps
+        // still work because the conversation is already at the menu.
+        bubble('Welcome back to ' + NAME + '. How can I help?', 'bot');
+        renderMenu();
+      } else {
+        send.disabled = true;
+        var t = setTyping();
+        sendMsg('Hi')
+          .then(function(d){ t.remove(); bubble(stripMenu(d.reply), 'bot'); renderMenu(); })
+          .catch(function(){ t.remove(); })
+          .finally(function(){ send.disabled = false; });
+      }
     }
     if (open) setTimeout(function(){ input.focus(); }, 50);
   }
