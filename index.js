@@ -2756,8 +2756,6 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     #_zw-head-info{flex:1;min-width:0}
     #_zw-head-name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     #_zw-head-sub{font-size:11px;opacity:.8;margin-top:1px}
-    #_zw-close{background:none;border:none;color:${ACCENT_INK};cursor:pointer;opacity:.8;font-size:20px;line-height:1;padding:2px}
-    #_zw-close:hover{opacity:1}
     #_zw-msgs{flex:1;overflow-y:auto;padding:16px 14px;display:flex;flex-direction:column;gap:8px;background:${CANVAS}}
     #_zw-msgs::-webkit-scrollbar{width:4px}
     #_zw-msgs::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:2px}
@@ -2766,7 +2764,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     ._zw-bubble.bot{align-self:flex-start;background:${SURFACE};color:${INK};border-bottom-left-radius:5px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
     ._zw-bubble.typing{align-self:flex-start;background:${SURFACE};color:#9ca3af;font-style:italic;
       box-shadow:0 1px 3px rgba(0,0,0,.08);border-bottom-left-radius:5px}
-    #_zw-footer{border-top:1px solid #e5e7eb;padding:10px;background:${SURFACE};flex-shrink:0;display:flex;gap:8px}
+    #_zw-footer{border-top:1px solid #e5e7eb;padding:10px;background:${SURFACE};flex-shrink:0;display:flex;align-items:flex-end;gap:6px}
     #_zw-input{flex:1;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;font-size:13.5px;
       outline:none;resize:none;font-family:inherit;line-height:1.4;max-height:80px}
     #_zw-input:focus{border-color:${ACCENT}}
@@ -2774,6 +2772,35 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
       cursor:pointer;font-weight:600;font-size:13px;flex-shrink:0;transition:filter .15s,opacity .15s}
     #_zw-send:hover{filter:brightness(.92)}
     #_zw-send:disabled{opacity:.5;cursor:not-allowed}
+    /* header actions */
+    #_zw-head-actions{display:flex;align-items:center;gap:2px}
+    ._zw-head-btn{background:none;border:none;color:${ACCENT_INK};cursor:pointer;opacity:.85;padding:5px;
+      display:flex;border-radius:7px;transition:opacity .15s,background .15s}
+    ._zw-head-btn:hover{opacity:1;background:rgba(255,255,255,.18)}
+    ._zw-head-btn svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    /* tappable menu */
+    ._zw-menu{display:flex;flex-direction:column;gap:10px;margin-top:2px}
+    ._zw-menu-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:12px 14px;
+      border-radius:11px;border:1px solid #e7eaf0;background:#f1f4f8;cursor:pointer;transition:background .12s;font-family:inherit}
+    ._zw-menu-item:hover:not(:disabled){background:#e7ecf3}
+    ._zw-menu-item:disabled{cursor:default;opacity:.55}
+    ._zw-menu-ico{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
+      background:${SURFACE};color:${ACCENT};border:1px solid #e7eaf0;flex-shrink:0}
+    ._zw-menu-ico svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    ._zw-menu-txt{display:flex;flex-direction:column;gap:1px}
+    ._zw-menu-label{font-size:14px;font-weight:550;color:${INK}}
+    ._zw-menu-sub{font-size:12px;color:#7a869a}
+    /* attachment */
+    #_zw-attach{background:none;border:none;color:#7a869a;cursor:pointer;padding:6px;display:flex;align-items:center;
+      border-radius:8px;flex-shrink:0;transition:background .15s}
+    #_zw-attach:hover{background:#f1f4f8}
+    #_zw-attach svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    #_zw-attbar{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;
+      border-top:1px solid #e5e7eb;background:${SURFACE};font-size:13px;color:${INK}}
+    #_zw-attbar.hide{display:none}
+    #_zw-attname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #_zw-attx{border:none;background:#f1f4f8;border-radius:7px;width:24px;height:24px;cursor:pointer;
+      color:#7a869a;flex-shrink:0;line-height:1;font-size:15px}
   \`;
 
   var style = document.createElement('style');
@@ -2790,10 +2817,23 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
           <div id="_zw-head-name">\${NAME}</div>
           <div id="_zw-head-sub">${HEAD_SUB}</div>
         </div>
-        <button id="_zw-close" title="Close">&times;</button>
+        <div id="_zw-head-actions">
+          <button id="_zw-human" class="_zw-head-btn" title="Talk to a person" aria-label="Talk to a person">
+            <svg viewBox="0 0 24 24"><path d="M3 11h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H4a1 1 0 0 1-1-1v-5a9 9 0 0 1 18 0v5a1 1 0 0 1-1 1h-2a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/></svg>
+          </button>
+          <button id="_zw-close" class="_zw-head-btn" title="Close" aria-label="Close" style="font-size:20px;line-height:1">&times;</button>
+        </div>
       </div>
       <div id="_zw-msgs"></div>
+      <div id="_zw-attbar" class="hide">
+        <span id="_zw-attname"></span>
+        <button id="_zw-attx" title="Remove attachment" aria-label="Remove attachment">&times;</button>
+      </div>
       <div id="_zw-footer">
+        <input type="file" id="_zw-file" accept="image/jpeg,image/png,image/webp,application/pdf" style="display:none">
+        <button id="_zw-attach" title="Attach prescription or image" aria-label="Attach a file">
+          <svg viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
         <textarea id="_zw-input" placeholder="${PLACEHOLDER}" rows="1"></textarea>
         <button id="_zw-send">Send</button>
       </div>
@@ -2804,10 +2844,26 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   \`;
   document.body.appendChild(wrap);
 
-  var box   = document.getElementById('_zw-box');
-  var msgs  = document.getElementById('_zw-msgs');
-  var input = document.getElementById('_zw-input');
-  var send  = document.getElementById('_zw-send');
+  var box     = document.getElementById('_zw-box');
+  var msgs    = document.getElementById('_zw-msgs');
+  var input   = document.getElementById('_zw-input');
+  var send    = document.getElementById('_zw-send');
+  var fileIn  = document.getElementById('_zw-file');
+  var attbar  = document.getElementById('_zw-attbar');
+  var attname = document.getElementById('_zw-attname');
+
+  // Tappable quick-start menu. intent values map to the server's INTENT_MENU
+  // (order|consultation|enquiry), so a tap skips the typed MENU step.
+  var MENU = [
+    { id:'order',        label:'Place an order',      sub:'Browse and buy',
+      ico:'<svg viewBox="0 0 24 24"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>' },
+    { id:'consultation', label:'Book a consultation', sub:'Speak to a pharmacist',
+      ico:'<svg viewBox="0 0 24 24"><path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="m9 16 2 2 4-4"/></svg>' },
+    { id:'enquiry',      label:'Make an enquiry',     sub:'Ask a question',
+      ico:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>' }
+  ];
+  var menuShown   = false;
+  var pendingFile = null;
 
   function bubble(text, role) {
     var el = document.createElement('div');
@@ -2824,11 +2880,54 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     return el;
   }
 
-  function sendMsg(text, attachment) {
+  // Strip the server's numbered menu lines from a reply — the widget renders
+  // its own tappable menu instead (mirrors the React widget).
+  function stripMenu(text) {
+    return (text || '').replace(/\\n+\\d+\\.\\s.*/g, '').trim();
+  }
+
+  // Renders the tappable menu once, after the opening greeting.
+  function renderMenu() {
+    if (menuShown) return;
+    menuShown = true;
+    var wrapEl = document.createElement('div');
+    wrapEl.className = '_zw-bubble bot';
+    var list = document.createElement('div');
+    list.className = '_zw-menu';
+    MENU.forEach(function(it){
+      var b = document.createElement('button');
+      b.className = '_zw-menu-item';
+      b.innerHTML =
+        '<span class="_zw-menu-ico">' + it.ico + '</span>' +
+        '<span class="_zw-menu-txt"><span class="_zw-menu-label"></span><span class="_zw-menu-sub"></span></span>';
+      b.querySelector('._zw-menu-label').textContent = it.label;
+      b.querySelector('._zw-menu-sub').textContent   = it.sub;
+      b.addEventListener('click', function(){ chooseIntent(it); });
+      list.appendChild(b);
+    });
+    wrapEl.appendChild(list);
+    msgs.appendChild(wrapEl);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function chooseIntent(it) {
+    var btns = msgs.querySelectorAll('._zw-menu-item');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
+    bubble(it.label, 'user');
+    send.disabled = true;
+    var t = setTyping();
+    sendMsg(it.label, null, it.id)
+      .then(function(d){ t.remove(); bubble(d.reply, 'bot'); })
+      .catch(function(){ t.remove(); bubble('Something went wrong. Please try again.', 'bot'); })
+      .finally(function(){ send.disabled = false; input.focus(); });
+  }
+
+  function sendMsg(text, attachment, intent) {
     var body = new FormData();
     body.append('widgetKey', KEY);
     body.append('text', text || '');
-    if (sid) body.append('conversationId', sid);
+    if (sid)        body.append('conversationId', sid);
+    if (intent)     body.append('intent', intent);
     if (attachment) body.append('attachment', attachment);
     return fetch(API + '/api/web/message', { method: 'POST', body: body })
       .then(function(r){ return r.json(); })
@@ -2838,15 +2937,43 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
       });
   }
 
+  function setAttach(f) {
+    pendingFile = f;
+    attname.textContent = f.name;
+    attbar.classList.remove('hide');
+  }
+  function clearAttach() {
+    pendingFile = null;
+    fileIn.value = '';
+    attbar.classList.add('hide');
+  }
+
+  // Flags the conversation for staff and opens the WhatsApp deep-link.
+  function requestHuman() {
+    fetch(API + '/api/web/handoff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sid ? { widgetKey: KEY, conversationId: sid } : { widgetKey: KEY })
+    })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.whatsapp_link) window.open(d.whatsapp_link, '_blank', 'noopener,noreferrer');
+        else bubble("I've let the team know — someone will be in touch with you shortly.", 'bot');
+      })
+      .catch(function(){ bubble('Unable to reach the team right now. Please try again.', 'bot'); });
+  }
+
   function submit() {
     var text = input.value.trim();
-    if (!text || send.disabled) return;
-    bubble(text, 'user');
+    if ((!text && !pendingFile) || send.disabled) return;
+    var file = pendingFile;
+    bubble(text || ('Sent ' + file.name), 'user');
     input.value = '';
     input.style.height = '';
+    clearAttach();
     send.disabled = true;
     var t = setTyping();
-    sendMsg(text)
+    sendMsg(text || '', file)
       .then(function(d){ t.remove(); bubble(d.reply, 'bot'); })
       .catch(function(){ t.remove(); bubble('Something went wrong. Please try again.', 'bot'); })
       .finally(function(){ send.disabled = false; input.focus(); });
@@ -2859,7 +2986,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
       send.disabled = true;
       var t = setTyping();
       sendMsg('Hi')
-        .then(function(d){ t.remove(); bubble(d.reply, 'bot'); })
+        .then(function(d){ t.remove(); bubble(stripMenu(d.reply), 'bot'); renderMenu(); })
         .catch(function(){ t.remove(); })
         .finally(function(){ send.disabled = false; });
     }
@@ -2868,6 +2995,14 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
 
   document.getElementById('_zw-btn').addEventListener('click', toggleOpen);
   document.getElementById('_zw-close').addEventListener('click', toggleOpen);
+  document.getElementById('_zw-human').addEventListener('click', requestHuman);
+  document.getElementById('_zw-attach').addEventListener('click', function(){ fileIn.click(); });
+  fileIn.addEventListener('change', function(e){
+    var f = e.target.files && e.target.files[0];
+    if (f) setAttach(f);
+    e.target.value = '';
+  });
+  document.getElementById('_zw-attx').addEventListener('click', clearAttach);
   send.addEventListener('click', submit);
   input.addEventListener('keydown', function(e){
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
