@@ -1,5 +1,20 @@
 'use client';
 
+/* ============================================================================
+ * FROZEN — NOT THE MAINTAINED WIDGET. DO NOT EDIT FOR FEATURE/STYLE CHANGES.
+ *
+ * The canonical, deployed widget is the hosted script generated in index.js
+ * and served at  GET /widget/:widgetKey.js  — that one embeds on any site with
+ * a single <script> tag and is themed per tenant from pharmacy_config.theme.
+ * It already has feature parity with this component (tappable menu, attachment
+ * upload, WhatsApp handoff).
+ *
+ * This React component is kept only as a reference / drop-in for a future
+ * React-client offering. It is NOT used by any live site. Make all widget UI
+ * and behaviour changes in the hosted script in index.js — changing only this
+ * file will not affect any customer.
+ * ========================================================================== */
+
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import {
   Send,
