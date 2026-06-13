@@ -2779,8 +2779,8 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     ._zw-head-btn:hover{opacity:1;background:rgba(255,255,255,.18)}
     ._zw-head-btn svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
     /* tappable menu */
-    ._zw-menu{display:flex;flex-direction:column;gap:10px;margin-top:2px}
-    ._zw-menu-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:12px 14px;
+    ._zw-menu{display:flex;flex-direction:column;gap:10px;width:100%;margin:4px 0 2px}
+    ._zw-menu-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:13px 14px;
       border-radius:11px;border:1px solid #e7eaf0;background:#f1f4f8;cursor:pointer;transition:background .12s;font-family:inherit}
     ._zw-menu-item:hover:not(:disabled){background:#e7ecf3}
     ._zw-menu-item:disabled{cursor:default;opacity:.55}
@@ -2890,8 +2890,9 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   function renderMenu() {
     if (menuShown) return;
     menuShown = true;
-    var wrapEl = document.createElement('div');
-    wrapEl.className = '_zw-bubble bot';
+    // Render as a standalone full-width option list — NOT inside a chat bubble.
+    // A bubble caps width at 78% and adds shadow/padding, which squeezes the
+    // option boxes; full-width cards are the standard quick-reply pattern.
     var list = document.createElement('div');
     list.className = '_zw-menu';
     MENU.forEach(function(it){
@@ -2905,8 +2906,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
       b.addEventListener('click', function(){ chooseIntent(it); });
       list.appendChild(b);
     });
-    wrapEl.appendChild(list);
-    msgs.appendChild(wrapEl);
+    msgs.appendChild(list);
     msgs.scrollTop = msgs.scrollHeight;
   }
 
