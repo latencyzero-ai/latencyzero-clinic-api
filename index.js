@@ -3028,7 +3028,16 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   });
 })();`;
 
-    res.type('application/javascript').set('Cache-Control', 'public, max-age=300').send(script);
+    // No browser caching for the widget script. With max-age the browser
+    // replays the old script for the whole window and never sees new deploys —
+    // the cause of "I deploy but nothing changes". no-store forces a fresh
+    // fetch on every page load so config/style/code changes appear immediately.
+    res
+      .type('application/javascript')
+      .set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+      .set('Pragma', 'no-cache')
+      .set('Expires', '0')
+      .send(script);
   } catch (err) {
     res.status(500).type('application/javascript').send('/* Zero: internal error */');
   }
