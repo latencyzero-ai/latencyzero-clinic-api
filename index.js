@@ -2758,14 +2758,14 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     #_zw-head-sub{font-size:11px;opacity:.8;margin-top:1px}
     #_zw-close{background:none;border:none;color:${ACCENT_INK};cursor:pointer;opacity:.8;font-size:20px;line-height:1;padding:2px}
     #_zw-close:hover{opacity:1}
-    #_zw-msgs{flex:1;overflow-y:auto;padding:14px 12px;display:flex;flex-direction:column;gap:8px;background:${CANVAS}}
+    #_zw-msgs{flex:1;overflow-y:auto;padding:16px 14px;display:flex;flex-direction:column;gap:8px;background:${CANVAS}}
     #_zw-msgs::-webkit-scrollbar{width:4px}
     #_zw-msgs::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:2px}
-    ._zw-bubble{max-width:82%;padding:9px 13px;border-radius:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-size:13.5px}
-    ._zw-bubble.user{align-self:flex-end;background:${USER_BUBBLE};color:#fff;border-bottom-right-radius:3px}
-    ._zw-bubble.bot{align-self:flex-start;background:${SURFACE};color:${INK};border-bottom-left-radius:3px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+    ._zw-bubble{max-width:78%;padding:12px 16px;border-radius:16px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-size:14.5px}
+    ._zw-bubble.user{align-self:flex-end;background:${USER_BUBBLE};color:#fff;border-bottom-right-radius:5px}
+    ._zw-bubble.bot{align-self:flex-start;background:${SURFACE};color:${INK};border-bottom-left-radius:5px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
     ._zw-bubble.typing{align-self:flex-start;background:${SURFACE};color:#9ca3af;font-style:italic;
-      box-shadow:0 1px 3px rgba(0,0,0,.08);border-bottom-left-radius:3px}
+      box-shadow:0 1px 3px rgba(0,0,0,.08);border-bottom-left-radius:5px}
     #_zw-footer{border-top:1px solid #e5e7eb;padding:10px;background:${SURFACE};flex-shrink:0;display:flex;gap:8px}
     #_zw-input{flex:1;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;font-size:13.5px;
       outline:none;resize:none;font-family:inherit;line-height:1.4;max-height:80px}
