@@ -2787,9 +2787,9 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     ._zw-menu-ico{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
       background:${SURFACE};color:${ACCENT};border:1px solid #e7eaf0;flex-shrink:0}
     ._zw-menu-ico svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-    ._zw-menu-txt{display:flex;flex-direction:column;gap:1px}
-    ._zw-menu-label{font-size:14px;font-weight:550;color:${INK}}
-    ._zw-menu-sub{font-size:12px;color:#7a869a}
+    ._zw-menu-txt{display:flex;flex-direction:column;gap:3px;min-width:0}
+    ._zw-menu-label{font-size:14px;font-weight:600;line-height:1.3;color:${INK}}
+    ._zw-menu-sub{font-size:12px;line-height:1.3;color:#7a869a}
     /* attachment */
     #_zw-attach{background:none;border:none;color:#7a869a;cursor:pointer;padding:6px;display:flex;align-items:center;
       border-radius:8px;flex-shrink:0;transition:background .15s}
