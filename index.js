@@ -2689,7 +2689,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   try {
     const { widgetKey } = req.params;
     const result = await pool.query(
-      'SELECT pharmacy_name FROM pharmacy_config WHERE widget_key = $1 AND active = true LIMIT 1',
+      'SELECT pharmacy_name, theme FROM pharmacy_config WHERE widget_key = $1 AND active = true LIMIT 1',
       [widgetKey]
     );
     if (result.rows.length === 0) {
@@ -2697,6 +2697,38 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     }
     const pharmacyName = result.rows[0].pharmacy_name;
     const apiUrl = (process.env.RENDER_EXTERNAL_URL || `https://latencyzero-clinic-api.onrender.com`).replace(/\/$/, '');
+
+    // ── Per-tenant branding (pharmacy_config.theme, migration 005) ──
+    // Fallbacks preserve the original blue look for unthemed tenants. Values
+    // are interpolated into CSS/HTML, so they're strictly validated: colors
+    // must parse as hex/rgb(a), fonts as a plain family list, and the agent
+    // name is HTML-escaped. Anything else (including '<<FILL_ME' seed
+    // placeholders) silently falls back.
+    const rawTheme = result.rows[0].theme || {};
+    const color = (v, fb) =>
+      (typeof v === 'string' && /^(#[0-9a-fA-F]{3,8}|rgba?\([\d\s,.%]+\))$/.test(v.trim()))
+        ? v.trim() : fb;
+    const ACCENT      = color(rawTheme.accent,     '#0d7fe8');
+    const ACCENT_INK  = color(rawTheme.accentInk,  '#ffffff');
+    const USER_BUBBLE = color(rawTheme.userBubble, ACCENT);
+    const SURFACE     = color(rawTheme.surface,    '#ffffff');
+    const CANVAS      = color(rawTheme.canvas,     '#f9fafb');
+    const INK         = color(rawTheme.ink,        '#111111');
+    const FONT =
+      (typeof rawTheme.fontFamily === 'string' &&
+       /^[\w\s,'"-]+$/.test(rawTheme.fontFamily) &&
+       !rawTheme.fontFamily.includes('<<FILL_ME'))
+        ? rawTheme.fontFamily.trim()
+        : 'system-ui,-apple-system,sans-serif';
+    const AGENT =
+      (typeof rawTheme.agentDisplayName === 'string' &&
+       rawTheme.agentDisplayName.trim() &&
+       !rawTheme.agentDisplayName.includes('<<FILL_ME'))
+        ? rawTheme.agentDisplayName.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        : null;
+    const AVATAR_LETTER = (AGENT || 'Z').charAt(0).toUpperCase();
+    const HEAD_SUB      = AGENT ? `${AGENT} • AI assistant` : 'AI Pharmacy Assistant';
+    const PLACEHOLDER   = AGENT ? `Message ${AGENT}…` : 'Type a message…';
 
     const script = `(function(){
   var API    = ${JSON.stringify(apiUrl)};
@@ -2707,41 +2739,41 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   var open   = false;
 
   var css = \`
-    #_zw{position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:system-ui,-apple-system,sans-serif;font-size:14px}
+    #_zw{position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:${FONT};font-size:14px}
     #_zw *{box-sizing:border-box;margin:0;padding:0}
-    #_zw-btn{width:56px;height:56px;border-radius:50%;background:#0d7fe8;border:none;cursor:pointer;
-      box-shadow:0 4px 20px rgba(13,127,232,.4);display:flex;align-items:center;justify-content:center;
+    #_zw-btn{width:56px;height:56px;border-radius:50%;background:${ACCENT};border:none;cursor:pointer;
+      box-shadow:0 4px 20px rgba(0,0,0,.28);display:flex;align-items:center;justify-content:center;
       margin-left:auto;transition:transform .2s}
     #_zw-btn:hover{transform:scale(1.08)}
-    #_zw-btn svg{width:24px;height:24px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-    #_zw-box{width:360px;height:520px;background:#fff;border-radius:16px;
+    #_zw-btn svg{width:24px;height:24px;fill:none;stroke:${ACCENT_INK};stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    #_zw-box{width:360px;height:520px;background:${SURFACE};border-radius:16px;
       box-shadow:0 8px 40px rgba(0,0,0,.18);display:flex;flex-direction:column;
       margin-bottom:12px;overflow:hidden;transition:opacity .2s,transform .2s}
     #_zw-box.hide{opacity:0;transform:translateY(12px);pointer-events:none}
-    #_zw-head{background:#0d7fe8;color:#fff;padding:14px 16px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+    #_zw-head{background:${ACCENT};color:${ACCENT_INK};padding:14px 16px;display:flex;align-items:center;gap:10px;flex-shrink:0}
     #_zw-head-avatar{width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.25);
       display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0}
     #_zw-head-info{flex:1;min-width:0}
     #_zw-head-name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     #_zw-head-sub{font-size:11px;opacity:.8;margin-top:1px}
-    #_zw-close{background:none;border:none;color:#fff;cursor:pointer;opacity:.8;font-size:20px;line-height:1;padding:2px}
+    #_zw-close{background:none;border:none;color:${ACCENT_INK};cursor:pointer;opacity:.8;font-size:20px;line-height:1;padding:2px}
     #_zw-close:hover{opacity:1}
-    #_zw-msgs{flex:1;overflow-y:auto;padding:14px 12px;display:flex;flex-direction:column;gap:8px;background:#f9fafb}
+    #_zw-msgs{flex:1;overflow-y:auto;padding:14px 12px;display:flex;flex-direction:column;gap:8px;background:${CANVAS}}
     #_zw-msgs::-webkit-scrollbar{width:4px}
     #_zw-msgs::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:2px}
     ._zw-bubble{max-width:82%;padding:9px 13px;border-radius:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;font-size:13.5px}
-    ._zw-bubble.user{align-self:flex-end;background:#0d7fe8;color:#fff;border-bottom-right-radius:3px}
-    ._zw-bubble.bot{align-self:flex-start;background:#fff;color:#111;border-bottom-left-radius:3px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
-    ._zw-bubble.typing{align-self:flex-start;background:#fff;color:#9ca3af;font-style:italic;
+    ._zw-bubble.user{align-self:flex-end;background:${USER_BUBBLE};color:#fff;border-bottom-right-radius:3px}
+    ._zw-bubble.bot{align-self:flex-start;background:${SURFACE};color:${INK};border-bottom-left-radius:3px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+    ._zw-bubble.typing{align-self:flex-start;background:${SURFACE};color:#9ca3af;font-style:italic;
       box-shadow:0 1px 3px rgba(0,0,0,.08);border-bottom-left-radius:3px}
-    #_zw-footer{border-top:1px solid #e5e7eb;padding:10px;background:#fff;flex-shrink:0;display:flex;gap:8px}
+    #_zw-footer{border-top:1px solid #e5e7eb;padding:10px;background:${SURFACE};flex-shrink:0;display:flex;gap:8px}
     #_zw-input{flex:1;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;font-size:13.5px;
       outline:none;resize:none;font-family:inherit;line-height:1.4;max-height:80px}
-    #_zw-input:focus{border-color:#0d7fe8}
-    #_zw-send{background:#0d7fe8;color:#fff;border:none;border-radius:8px;padding:8px 14px;
-      cursor:pointer;font-weight:600;font-size:13px;flex-shrink:0;transition:background .15s}
-    #_zw-send:hover{background:#0b6fd0}
-    #_zw-send:disabled{background:#93c5fd;cursor:not-allowed}
+    #_zw-input:focus{border-color:${ACCENT}}
+    #_zw-send{background:${ACCENT};color:${ACCENT_INK};border:none;border-radius:8px;padding:8px 14px;
+      cursor:pointer;font-weight:600;font-size:13px;flex-shrink:0;transition:filter .15s,opacity .15s}
+    #_zw-send:hover{filter:brightness(.92)}
+    #_zw-send:disabled{opacity:.5;cursor:not-allowed}
   \`;
 
   var style = document.createElement('style');
@@ -2753,16 +2785,16 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   wrap.innerHTML = \`
     <div id="_zw-box" class="hide">
       <div id="_zw-head">
-        <div id="_zw-head-avatar">Z</div>
+        <div id="_zw-head-avatar">${AVATAR_LETTER}</div>
         <div id="_zw-head-info">
           <div id="_zw-head-name">\${NAME}</div>
-          <div id="_zw-head-sub">AI Pharmacy Assistant</div>
+          <div id="_zw-head-sub">${HEAD_SUB}</div>
         </div>
         <button id="_zw-close" title="Close">&times;</button>
       </div>
       <div id="_zw-msgs"></div>
       <div id="_zw-footer">
-        <textarea id="_zw-input" placeholder="Type a message…" rows="1"></textarea>
+        <textarea id="_zw-input" placeholder="${PLACEHOLDER}" rows="1"></textarea>
         <button id="_zw-send">Send</button>
       </div>
     </div>
