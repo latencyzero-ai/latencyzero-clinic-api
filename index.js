@@ -2764,11 +2764,10 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     ._zw-bubble.bot{align-self:flex-start;background:${SURFACE};color:${INK};border-bottom-left-radius:5px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
     ._zw-bubble.typing{align-self:flex-start;background:${SURFACE};color:#9ca3af;font-style:italic;
       box-shadow:0 1px 3px rgba(0,0,0,.08);border-bottom-left-radius:5px}
-    #_zw-footer{border-top:1px solid #e5e7eb;padding:10px;background:${SURFACE};flex-shrink:0;display:flex;align-items:flex-end;gap:6px}
-    #_zw-input{flex:1;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;font-size:13.5px;
-      outline:none;resize:none;font-family:inherit;line-height:1.4;max-height:80px}
-    #_zw-input:focus{border-color:${ACCENT}}
-    #_zw-send{background:${ACCENT};color:${ACCENT_INK};border:none;border-radius:8px;padding:8px 14px;
+    #_zw-footer{border-top:1px solid #e5e7eb;padding:10px 12px;background:${SURFACE};flex-shrink:0;display:flex;align-items:center;gap:10px}
+    #_zw-input{flex:1;min-width:0;border:none;outline:none;background:transparent;padding:10px 8px;font-size:13.5px;
+      resize:none;font-family:inherit;line-height:1.4;max-height:80px;color:${INK}}
+    #_zw-send{background:${ACCENT};color:${ACCENT_INK};border:none;border-radius:8px;height:38px;padding:0 16px;
       cursor:pointer;font-weight:600;font-size:13px;flex-shrink:0;transition:filter .15s,opacity .15s}
     #_zw-send:hover{filter:brightness(.92)}
     #_zw-send:disabled{opacity:.5;cursor:not-allowed}
@@ -2791,7 +2790,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     ._zw-menu-label{font-size:14px;font-weight:600;line-height:1.3;color:${INK}}
     ._zw-menu-sub{font-size:12px;line-height:1.3;color:#7a869a}
     /* attachment */
-    #_zw-attach{background:none;border:none;color:#7a869a;cursor:pointer;padding:6px;display:flex;align-items:center;
+    #_zw-attach{background:none;border:none;color:#7a869a;cursor:pointer;width:38px;height:38px;display:flex;align-items:center;justify-content:center;
       border-radius:8px;flex-shrink:0;transition:background .15s}
     #_zw-attach:hover{background:#f1f4f8}
     #_zw-attach svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
