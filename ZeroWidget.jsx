@@ -736,9 +736,9 @@ function makeStyles(T, font) {
       border      : `1px solid ${T.line}`,
       flexShrink  : 0,
     },
-    menuText : { display: "flex", flexDirection: "column", gap: 1 },
-    menuLabel: { fontSize: 14, fontWeight: 550, color: T.ink },
-    menuSub  : { fontSize: 12, color: T.sub },
+    menuText : { display: "flex", flexDirection: "column", gap: 4 },
+    menuLabel: { fontSize: 14, fontWeight: 600, lineHeight: 1.3, color: T.ink },
+    menuSub  : { fontSize: 12, lineHeight: 1.3, color: T.sub },
     fileChip : {
       display    : "inline-flex",
       alignItems : "center",
