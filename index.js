@@ -2778,9 +2778,10 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     ._zw-head-btn:hover{opacity:1;background:rgba(255,255,255,.18)}
     ._zw-head-btn svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
     /* tappable menu */
+    ._zw-menu-wrap{max-width:94%}
     ._zw-menu{display:flex;flex-direction:column;gap:10px}
     ._zw-menu-title{font-size:14.5px;font-weight:600;color:${INK};margin-bottom:11px}
-    ._zw-menu-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:12px 14px;
+    ._zw-menu-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:14px 16px;
       border-radius:11px;border:1px solid #e7eaf0;background:#f1f4f8;cursor:pointer;transition:background .12s;font-family:inherit}
     ._zw-menu-item:hover:not(:disabled){background:#e7ecf3}
     ._zw-menu-item:disabled{cursor:default;opacity:.55}
@@ -2868,7 +2869,9 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   function bubble(text, role) {
     var el = document.createElement('div');
     el.className = '_zw-bubble ' + role;
-    el.textContent = text;
+    // Server messages use *asterisks* for bold (markdown). We render plain text,
+    // so strip them rather than show literal asterisks.
+    el.textContent = (text || '').replace(/\*/g, '');
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
     return el;
@@ -2893,7 +2896,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     // Mirror ZeroWidget.jsx exactly: a chat bubble containing a "How can I
     // help?" title and the option list.
     var wrapEl = document.createElement('div');
-    wrapEl.className = '_zw-bubble bot';
+    wrapEl.className = '_zw-bubble bot _zw-menu-wrap';
     var title = document.createElement('div');
     title.className = '_zw-menu-title';
     title.textContent = 'How can I help?';

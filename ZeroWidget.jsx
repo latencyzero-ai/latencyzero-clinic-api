@@ -456,7 +456,7 @@ export default function ZeroWidget(props) {
             if (m.type === "menu") {
               return (
                 <div key={i} style={S.bubbleAgentWrap}>
-                  <div style={{ ...S.bubble, ...S.bubbleAgent }}>
+                  <div style={{ ...S.bubble, ...S.bubbleAgent, maxWidth: "94%" }}>
                     <div style={S.menuTitle}>How can I help?</div>
                     <div style={S.menuList}>
                       {MENU_ITEMS.map(item => (
@@ -484,7 +484,7 @@ export default function ZeroWidget(props) {
             const isUser = m.role === "user";
             const text   = m.fallbackIntro
               ? `Hi, I'm ${agentName}, your AI agent for ${pharmacyName}.`
-              : m.text;
+              : (m.text || "").replace(/\*/g, ""); // strip markdown bold markers
             return (
               <div key={i} style={isUser ? S.bubbleUserWrap : S.bubbleAgentWrap}>
                 <div style={{ ...S.bubble, ...(isUser ? S.bubbleUser : S.bubbleAgent) }}>
@@ -718,7 +718,7 @@ function makeStyles(T, font) {
       gap        : 12,
       width      : "100%",
       textAlign  : "left",
-      padding    : "12px 14px",
+      padding    : "14px 16px",
       borderRadius: 11,
       border     : `1px solid ${T.line}`,
       background : T.tint,
