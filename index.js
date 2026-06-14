@@ -2738,6 +2738,10 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   var sid    = sessionStorage.getItem(SK) || null;
   var open   = false;
 
+  var AGENT_NAME = ${JSON.stringify(AGENT || 'Zara')};
+  function GREETING_NEW(){ return "Hi, I'm " + AGENT_NAME + ", your assistant at " + NAME + ". How can I help?"; }
+  function GREETING_RETURNING(){ return "Hi, I'm " + AGENT_NAME + " — welcome back to " + NAME + ". How can I help?"; }
+
   var css = \`
     #_zw{position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:${FONT};font-size:14px}
     #_zw *{box-sizing:border-box;margin:0;padding:0}
@@ -2999,7 +3003,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
         // step, so re-sending 'Hi' would land on the MENU "didn't catch that"
         // reply and look like an error. Greet locally and show the menu; taps
         // still work because the conversation is already at the menu.
-        bubble('Welcome back to ' + NAME + '. How can I help?', 'bot');
+        bubble(GREETING_RETURNING(), 'bot');
         renderMenu();
       } else {
         send.disabled = true;
