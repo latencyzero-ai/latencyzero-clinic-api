@@ -2870,8 +2870,10 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     var el = document.createElement('div');
     el.className = '_zw-bubble ' + role;
     // Server messages use *asterisks* for bold (markdown). We render plain text,
-    // so strip them rather than show literal asterisks.
-    el.textContent = (text || '').replace(/\*/g, '');
+    // so strip them rather than show literal asterisks. Uses split/join (not a
+    // regex) because this code lives inside a template-literal string, where a
+    // regex backslash would be mangled.
+    el.textContent = (text || '').split('*').join('');
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
     return el;
