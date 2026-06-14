@@ -355,7 +355,11 @@ class SupabaseAdapter extends BaseAdapter {
   //
   // items : Array<{ product_id: string | number, qty: number }>
   async decrementStock(items) {
-    const { error: rpcErr } = await this._client.rpc('decrement_stock', { items });
+    // Send BOTH 'qty' and 'quantity' so the decrement_stock RPC decrements
+    // correctly whether its SQL reads item->>'qty' or item->>'quantity'.
+    // (Our interface uses qty; the RPC has been written against quantity.)
+    const rpcItems = items.map(i => ({ product_id: i.product_id, qty: i.qty, quantity: i.qty }));
+    const { error: rpcErr } = await this._client.rpc('decrement_stock', { items: rpcItems });
     if (!rpcErr) return; // RPC succeeded — stock updated atomically
 
     console.warn(
