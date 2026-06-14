@@ -2744,7 +2744,8 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
 
   var css = \`
     #_zw{position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:${FONT};font-size:14px}
-    #_zw *{box-sizing:border-box;margin:0;padding:0}
+    #_zw *{box-sizing:border-box}
+    #_zw button,#_zw input,#_zw textarea{margin:0;font-family:inherit}
     #_zw-btn{width:56px;height:56px;border-radius:50%;background:${ACCENT};border:none;cursor:pointer;
       box-shadow:0 4px 20px rgba(0,0,0,.28);display:flex;align-items:center;justify-content:center;
       margin-left:auto;transition:transform .2s}
