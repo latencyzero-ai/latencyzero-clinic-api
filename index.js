@@ -2817,7 +2817,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   wrap.innerHTML = \`
     <div id="_zw-box" class="hide">
       <div id="_zw-head">
-        <div id="_zw-head-avatar">${AVATAR_LETTER}</div>
+        <div id="_zw-head-avatar"><svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:none;stroke:${ACCENT_INK};stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round"><path d="M8 8h8l-7 8h7"/></svg></div>
         <div id="_zw-head-info">
           <div id="_zw-head-name">\${NAME}</div>
           <div id="_zw-head-sub">${HEAD_SUB}</div>
