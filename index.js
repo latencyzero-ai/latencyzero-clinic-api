@@ -2521,6 +2521,12 @@ app.post('/api/web/message',
         mediaFilename: file.originalname || `attachment_${Date.now()}`,
       } : null;
 
+      // Log the attachment boundary so a failed prescription upload is traceable
+      // end-to-end (widget → multer here → adapter.savePrescription).
+      if (file) {
+        addLog('info', `web attachment received: ${file.originalname || '(unnamed)'} | ${file.mimetype} | ${file.size} bytes | key ${widgetKey}`);
+      }
+
       // ── Synthesize menu selection from intent hint when no text is provided ──
       // Lets the widget skip the MENU step programmatically (e.g. an "Order Now" button)
       const INTENT_MENU = { order: '1', consultation: '2', enquiry: '3' };
@@ -2995,10 +3001,14 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
       .finally(function(){ send.disabled = false; input.focus(); });
   }
 
-  function toggleOpen() {
-    open = !open;
-    box.classList.toggle('hide', !open);
-    if (open && msgs.children.length === 0) {
+  // Opens the panel. Idempotent — a no-op if already open, so the host site can
+  // call window.ZaraWidget.open() freely. The first open greets and shows the
+  // tappable menu.
+  function openWidget() {
+    if (open) return;
+    open = true;
+    box.classList.remove('hide');
+    if (msgs.children.length === 0) {
       if (sid) {
         // Returning visitor: the conversation already exists past the START
         // step, so re-sending 'Hi' would land on the MENU "didn't catch that"
@@ -3015,11 +3025,54 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
           .finally(function(){ send.disabled = false; });
       }
     }
-    if (open) setTimeout(function(){ input.focus(); }, 50);
+    setTimeout(function(){ input.focus(); }, 50);
+  }
+
+  // Hides the panel. The conversation is kept (sid lives in sessionStorage), so
+  // reopening resumes where it left off rather than showing a dead state.
+  function closeWidget() {
+    if (!open) return;
+    open = false;
+    box.classList.add('hide');
+  }
+
+  function toggleOpen() { if (open) closeWidget(); else openWidget(); }
+
+  // Opens the panel and drives the order flow for a specific product, so a
+  // product button on the host site (e.g. "Submit via Zara") can jump straight
+  // into ordering it. Accepts a product object ({name|title|id}) or a plain
+  // name/id string.
+  function openWithProduct(product) {
+    var label = product == null ? ''
+      : (typeof product === 'object' ? (product.name || product.title || product.id || '') : String(product));
+    if (!open) { open = true; box.classList.remove('hide'); }
+    send.disabled = true;
+    // Brand-new conversation: greet first so the server's START step advances to
+    // MENU and doesn't swallow the order intent that follows.
+    var chain = Promise.resolve();
+    if (!sid && msgs.children.length === 0) {
+      var tg = setTyping();
+      chain = sendMsg('Hi').then(function(d){ tg.remove(); bubble(stripMenu(d.reply), 'bot'); });
+    }
+    chain
+      .then(function(){
+        menuShown = true; // skip the tappable menu — we go straight into ordering
+        bubble('Place an order', 'user');
+        var t = setTyping();
+        return sendMsg('Place an order', null, 'order').then(function(d){ t.remove(); bubble(d.reply, 'bot'); });
+      })
+      .then(function(){
+        if (!label) return;
+        bubble(label, 'user');
+        var t2 = setTyping();
+        return sendMsg(label).then(function(d2){ t2.remove(); bubble(d2.reply, 'bot'); });
+      })
+      .catch(function(){ bubble('Something went wrong. Please try again.', 'bot'); })
+      .finally(function(){ send.disabled = false; input.focus(); });
   }
 
   document.getElementById('_zw-btn').addEventListener('click', toggleOpen);
-  document.getElementById('_zw-close').addEventListener('click', toggleOpen);
+  document.getElementById('_zw-close').addEventListener('click', closeWidget);
   document.getElementById('_zw-human').addEventListener('click', requestHuman);
   document.getElementById('_zw-attach').addEventListener('click', function(){ fileIn.click(); });
   fileIn.addEventListener('change', function(e){
@@ -3036,6 +3089,15 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
     this.style.height = '';
     this.style.height = Math.min(this.scrollHeight, 80) + 'px';
   });
+
+  // Global opener API so the host site can drive Zara — e.g. a product card's
+  // "Submit via Zara" button calls window.ZaraWidget.openWithProduct(id).
+  // open() is idempotent; close() hides the panel.
+  window.ZaraWidget = {
+    open           : openWidget,
+    close          : closeWidget,
+    openWithProduct: openWithProduct,
+  };
 })();`;
 
     // No browser caching for the widget script. With max-age the browser

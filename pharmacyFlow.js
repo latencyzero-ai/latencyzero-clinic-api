@@ -107,6 +107,19 @@ function isPaymentClaim(rawMsg) {
   return /\b(made|sent|done|completed|finished)\b/.test(m) && /\b(payment|transfer)\b/.test(m);
 }
 
+// True when a message looks like a main-menu choice (number or keyword). Used
+// to route a customer straight back into a flow from the DONE state — e.g. when
+// they tap "1. Place an order" from the post-order "anything else?" prompt —
+// instead of replaying the welcome. Mirrors the MENU block's own triggers.
+function isMenuSelection(rawMsg) {
+  const m = (rawMsg || '').trim().toLowerCase();
+  if (!m) return false;
+  if (['1', '2', '3'].includes(m)) return true;
+  if (m.includes('same as last') || m.includes('last order') || m.includes('order again')) return true;
+  return /\b(order|buy|purchase|need|reorder|consult|appointment|book|enquir|question|ask)\b/.test(m)
+    || m.includes('see a doctor');
+}
+
 // Builds the bank-transfer instruction block from pharmacy_config
 // (migration 004: payment_details JSONB {bank_name, account_name,
 // account_number}). Returns null when manual payment isn't configured —
@@ -535,20 +548,29 @@ Populate extracted fields ONLY when you actually observed them in the customer m
         return reply;
       }
 
-      const firstName = state.customer_first_name || null;
-      const daypart   = getDaypart(pharmacyConfig.timezone);
-      const greeting  = firstName ? `${daypart}, ${firstName}.` : `${daypart}.`;
-      const welcome =
-        `${greeting} Welcome back to *${pharmacyConfig.pharmacy_name}*. How can I help?\n\n` +
-        `1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
-      history = [{ role: 'assistant', content: welcome, timestamp: now }];
-      await saveConv(externalUserId, pharmacyConfig.id, {
-        machine            : 'MENU',
-        recent_orders      : state.recent_orders || [],
-        customer_first_name: firstName,
-        last_order_id      : state.last_order_id || null, // kept so a later "I've paid" can reference it
-      }, history);
-      return welcome;
+      // Customer is picking a menu option (e.g. tapped "1. Place an order" from
+      // the post-order "anything else?" prompt): route straight into that flow
+      // instead of replaying the welcome. Switch to MENU and fall through to the
+      // MENU handler below, which pushes the message and dispatches it.
+      if (isMenuSelection(msg)) {
+        state.machine = 'MENU';
+        // (no return — fall through)
+      } else {
+        const firstName = state.customer_first_name || null;
+        const daypart   = getDaypart(pharmacyConfig.timezone);
+        const greeting  = firstName ? `${daypart}, ${firstName}.` : `${daypart}.`;
+        const welcome =
+          `${greeting} Welcome back to *${pharmacyConfig.pharmacy_name}*. How can I help?\n\n` +
+          `1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
+        history = [{ role: 'assistant', content: welcome, timestamp: now }];
+        await saveConv(externalUserId, pharmacyConfig.id, {
+          machine            : 'MENU',
+          recent_orders      : state.recent_orders || [],
+          customer_first_name: firstName,
+          last_order_id      : state.last_order_id || null, // kept so a later "I've paid" can reference it
+        }, history);
+        return welcome;
+      }
     }
 
     // ── MENU — detect selection ──
@@ -617,6 +639,41 @@ Populate extracted fields ONLY when you actually observed them in the customer m
       }
 
       const phase = state.phase;
+
+      // ── STRAY PRESCRIPTION ATTACHMENT ─────────────────────────────────────
+      // A prescription file can arrive outside the rx_confirm step — the
+      // customer attaches it early, or onto a cart that already holds its Rx
+      // item. rx_confirm has its own upload handler below; everywhere in the
+      // order flow we still capture the file (and log the outcome) so it
+      // attaches to the order instead of being silently dropped. Consultation
+      // and enquiry phases are left alone — they aren't order/Rx steps.
+      if (mediaAttachment && (mediaAttachment.buffer || mediaAttachment.mediaId) &&
+          phase !== 'rx_confirm' && phase !== 'consult_collect' && phase !== 'enquiry_collect') {
+        try {
+          const buffer = mediaAttachment.buffer || await downloadMedia(mediaAttachment.mediaId);
+          const { url } = await adapter.savePrescription({
+            buffer,
+            mimetype : mediaAttachment.mediaMime    || 'application/octet-stream',
+            filename : mediaAttachment.mediaFilename || `rx_${Date.now()}.bin`,
+          });
+          state.prescription_url = url;
+          addLog('info', `Prescription received (phase=${phase || 'none'}) for ${externalUserId}: ${url}`);
+          const ack = (state.cart && state.cart.length)
+            ? `Thanks, I've received your prescription and attached it to your order. Type *checkout* when you're ready, or tell me what else you need.`
+            : `Thanks, I've received your prescription. What would you like to order?`;
+          history.push({ role: 'assistant', content: ack, timestamp: now });
+          await saveConv(externalUserId, pharmacyConfig.id, state, history);
+          return ack;
+        } catch (e) {
+          console.error('[pharmacyFlow.savePrescription:stray]', e.message, e.details || '', e.hint || '', e.code || '');
+          addLog('error', 'Prescription upload failed (stray)',
+            [e.message, e.details, e.hint, e.code].filter(Boolean).join(' | '));
+          const errMsg = `There was a problem receiving your prescription. Please try sending it again as an image or PDF.`;
+          history.push({ role: 'assistant', content: errMsg, timestamp: now });
+          await saveConv(externalUserId, pharmacyConfig.id, state, history);
+          return errMsg;
+        }
+      }
 
       // Auto-execute reorder if MENU detected reorder intent before AI was involved
       if (state.pending_reorder) {
@@ -761,6 +818,13 @@ Populate extracted fields ONLY when you actually observed them in the customer m
               `Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`
             : `Our team will be in touch with payment details shortly.\n\n` +
               `Thank you for ordering from ${pharmacyConfig.pharmacy_name}.`;
+
+          // Loop back to the opening menu so the conversation doesn't dead-end
+          // after checkout. State goes to DONE; a reply of 1/2/3 routes straight
+          // back into a flow (see the DONE → MENU fall-through above).
+          confirmMsg +=
+            `\n\nIs there anything else I can help you with?\n\n` +
+            `1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
 
           history.push({ role: 'assistant', content: confirmMsg, timestamp: now });
           await saveConv(externalUserId, pharmacyConfig.id, {
