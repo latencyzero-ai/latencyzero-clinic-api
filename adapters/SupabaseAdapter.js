@@ -299,6 +299,7 @@ class SupabaseAdapter extends BaseAdapter {
       customer_email   : orderObj.customer_email    || null,
       delivery_address : orderObj.delivery_address  || orderObj.delivery_area || null,
       delivery_city    : orderObj.delivery_city      || null,
+      delivery_landmark: orderObj.delivery_landmark  || null,
       prescription_url : orderObj.prescription_url   || null,
       subtotal         : orderObj.subtotal,
       delivery_fee     : orderObj.delivery_fee       || 0,

@@ -120,6 +120,74 @@ function isMenuSelection(rawMsg) {
     || m.includes('see a doctor');
 }
 
+// ─── DELIVERY: ZONE-BASED FEE (no maps API) ───────────────────────────────────
+// pharmacy_config.delivery_zones (JSONB, migration 006):
+//   { "zones": [ {"name":"Ikeja","fee":500}, ... ], "default_fee": 1000 }
+// Matches the customer's typed area against a zone name (loose substring match,
+// either direction) and returns that zone's fee. Unmatched areas use default_fee
+// when set. When delivery_zones is absent/unfilled, falls back to the flat
+// pharmacy_config.delivery_fee — so existing tenants keep working unchanged.
+// Returns { fee:Number, zone:String|null, matched:Boolean }.
+function resolveDeliveryFee(area, pharmacyConfig) {
+  const cfg   = pharmacyConfig.delivery_zones;
+  const zones = cfg && Array.isArray(cfg.zones)
+    ? cfg.zones.filter(z => z && typeof z.name === 'string' && !/<<.*>>/.test(z.name))
+    : [];
+  if (zones.length) {
+    const a = (area || '').trim().toLowerCase();
+    if (a) {
+      const match = zones.find(z => {
+        const zn = z.name.trim().toLowerCase();
+        return a === zn || a.includes(zn) || zn.includes(a);
+      });
+      if (match) return { fee: Number(match.fee) || 0, zone: match.name, matched: true };
+    }
+    if (cfg.default_fee != null) return { fee: Number(cfg.default_fee) || 0, zone: null, matched: false };
+  }
+  return { fee: parseFloat(pharmacyConfig.delivery_fee) || 0, zone: null, matched: false };
+}
+
+// Example zone names (real, unfilled placeholders excluded) to hint the customer
+// when asking which area to deliver to. Empty string when none are configured.
+function zoneHint(pharmacyConfig) {
+  const cfg   = pharmacyConfig.delivery_zones;
+  const names = cfg && Array.isArray(cfg.zones)
+    ? cfg.zones.map(z => z && z.name).filter(n => typeof n === 'string' && !/<<.*>>/.test(n))
+    : [];
+  return names.length ? ` For example: ${names.slice(0, 4).join(', ')}.` : '';
+}
+
+// ─── SEQUENTIAL FIELD COLLECTORS (delivery / consultation / enquiry) ──────────
+// Each returns the next field to ask for as { awaiting, prompt }, or null when
+// every required field is present. The caller records the answer to whatever it
+// last asked (state.*_awaiting), then calls this for the next prompt — so an
+// invalid/blank answer simply leaves the field unset and re-asks the same one.
+
+function deliveryNextPrompt(d, pharmacyConfig) {
+  if (!d.name)    return { awaiting: 'name',    prompt: `Who should we deliver to? Please share the full name.` };
+  if (!d.phone)   return { awaiting: 'phone',   prompt: `What phone number should the rider call?` };
+  if (!d.address) return { awaiting: 'address', prompt: `What's the full delivery address? Please include the street and house/apartment number.` };
+  if (!d.area)    return { awaiting: 'area',    prompt: `Which area or zone should we deliver to?${zoneHint(pharmacyConfig)}` };
+  if (!d.landmark_asked) return { awaiting: 'landmark', prompt: `Any nearby landmark to help the rider find you? Reply with one, or *skip*.` };
+  return null;
+}
+
+function consultNextPrompt(c) {
+  if (!c.name)  return { awaiting: 'name',  prompt: `I can set that up with our pharmacist. What's your full name?` };
+  if (!c.phone) return { awaiting: 'phone', prompt: `What's the best phone number for the pharmacist to reach you on?` };
+  if (!c.about) return { awaiting: 'about', prompt: `Briefly, what would you like to consult about?` };
+  if (!c.time)  return { awaiting: 'time',  prompt: `When are you available? Share a preferred day and time.` };
+  if (c.on_meds == null) return { awaiting: 'meds', prompt: `Are you currently taking any medication? Reply *yes* (and what), or *no*.` };
+  return null;
+}
+
+function enquiryNextPrompt(e) {
+  if (!e.question) return { awaiting: 'question', prompt: `Sure — what's your question?` };
+  if (!e.name)     return { awaiting: 'name',     prompt: `Happy to get that answered for you. What's your name?` };
+  if (!e.contact)  return { awaiting: 'contact',  prompt: `And the best way to reach you — a phone number or email?` };
+  return null;
+}
+
 // Builds the bank-transfer instruction block from pharmacy_config
 // (migration 004: payment_details JSONB {bank_name, account_name,
 // account_number}). Returns null when manual payment isn't configured —
@@ -346,9 +414,11 @@ Populate extracted fields ONLY when you actually observed them in the customer m
   // ── ORDER SUMMARY ─────────────────────────────────────────────────────────
   // All arithmetic in server code — never in the LLM.
 
-  function buildOrderSummary(cart, fulfilment, deliveryArea, deliveryFeeConfig, currency) {
+  function buildOrderSummary(cart, fulfilment, deliveryArea, pharmacyConfig, currency) {
     const subtotal = cart.reduce((s, i) => s + i.price_snap * i.qty, 0);
-    const fee      = fulfilment === 'DELIVERY' ? (parseFloat(deliveryFeeConfig) || 0) : 0;
+    const fee      = fulfilment === 'DELIVERY'
+      ? resolveDeliveryFee(deliveryArea, pharmacyConfig).fee
+      : 0;
     const total    = subtotal + fee;
 
     const lines = cart.map(i =>
@@ -604,22 +674,40 @@ Populate extracted fields ONLY when you actually observed them in the customer m
         intro = `What product are you looking for? Tell me the name and I'll find it.`;
       } else if (msg === '2' || msg.includes('consult') || msg.includes('appointment') || msg.includes('see a doctor') || msg.includes('book')) {
         nextPhase = 'consult_collect';
-        intro = `I'll pass your details to our pharmacist. Please briefly describe what you need help with.`;
       } else if (msg === '3' || msg.includes('enquir') || msg.includes('question') || msg.includes('ask')) {
         nextPhase = 'enquiry_collect';
-        intro = `Sure. Type your question and I'll make sure it reaches the right person.`;
       }
 
       if (nextPhase) {
-        history.push({ role: 'assistant', content: intro, timestamp: now });
-        await saveConv(externalUserId, pharmacyConfig.id, {
+        const activeState = {
           machine            : 'ACTIVE',
           phase              : nextPhase,
           cart               : [],
           pending_reorder    : state.pending_reorder || null,
           recent_orders      : state.recent_orders || [],
           customer_first_name: state.customer_first_name || null,
-        }, history);
+        };
+
+        // Consultation/enquiry: seed the sequential collector and open with its
+        // first question (prefilling name/contact from the verified user).
+        if (nextPhase === 'consult_collect') {
+          const c = activeState.consult = {};
+          if (identity?.name)  c.name  = identity.name;
+          if (identity?.phone) c.phone = identity.phone;
+          const np = consultNextPrompt(c);
+          activeState.consult_awaiting = np ? np.awaiting : null;
+          intro = np ? np.prompt : `Let me set up your consultation.`;
+        } else if (nextPhase === 'enquiry_collect') {
+          const e = activeState.enquiry = {};
+          if (identity?.name)                   e.name    = identity.name;
+          if (identity?.phone || identity?.email) e.contact = identity.phone || identity.email;
+          const np = enquiryNextPrompt(e);
+          activeState.enquiry_awaiting = np ? np.awaiting : null;
+          intro = np ? np.prompt : `What's your question?`;
+        }
+
+        history.push({ role: 'assistant', content: intro, timestamp: now });
+        await saveConv(externalUserId, pharmacyConfig.id, activeState, history);
         return intro;
       }
 
@@ -681,60 +769,94 @@ Populate extracted fields ONLY when you actually observed them in the customer m
       }
 
       // ════════════════════════════════════════════════════
-      // CONSULTATION FLOW
+      // CONSULTATION FLOW — collect enough for a pharmacist to action.
+      // Zara gives NO medical advice; she captures details and routes to staff.
       // ════════════════════════════════════════════════════
       if (phase === 'consult_collect') {
-        if (!message || message.trim().length < 5) {
-          const ask = `Please describe what you need help with so we can prepare for your consultation.`;
-          history.push({ role: 'assistant', content: ask, timestamp: now });
-          await saveConv(externalUserId, pharmacyConfig.id, state, history);
-          return ask;
+        const c   = state.consult || (state.consult = {});
+        const ans = (message || '').trim();
+        const awaiting = state.consult_awaiting;
+
+        if      (awaiting === 'name'  && ans.length >= 2)                  c.name  = ans;
+        else if (awaiting === 'phone' && ans.replace(/\D/g, '').length >= 5) c.phone = ans;
+        else if (awaiting === 'about' && ans.length >= 3)                  c.about = ans;
+        else if (awaiting === 'time'  && ans.length >= 2)                  c.time  = ans;
+        else if (awaiting === 'meds') {
+          const a = ans.toLowerCase();
+          if (/^(no|n|none)\b/.test(a) || a === 'no') { c.on_meds = false; c.meds_detail = null; }
+          else { c.on_meds = true; c.meds_detail = ans.replace(/^y(es)?[\s,:.-]*/i, '').trim() || ans; }
         }
 
-        const details = message.trim();
+        const np = consultNextPrompt(c);
+        if (np) {
+          state.consult_awaiting = np.awaiting;
+          history.push({ role: 'assistant', content: np.prompt, timestamp: now });
+          await saveConv(externalUserId, pharmacyConfig.id, state, history);
+          return np.prompt;
+        }
+
+        // Complete → record/flag for staff and confirm the details back.
+        state.consult_awaiting = null;
+        const medsLine = c.on_meds ? (c.meds_detail || 'yes') : 'none';
+        const summary =
+          `- Name: ${c.name}\n- Contact: ${c.phone}\n- About: ${c.about}\n` +
+          `- Availability: ${c.time}\n- Current medication: ${medsLine}`;
         if (pharmacyConfig.handoff_number) {
           await sendWhatsApp(
             pharmacyConfig.handoff_number,
-            `*Consultation Request*\n\nFrom: ${externalUserId}\nDetails: ${details}`,
+            `*Consultation Request*\n\n${summary}\n\nFrom: ${externalUserId}`,
             pharmacyConfig.phone_number_id
           );
         }
         io.emit('queue_updated', { type: 'pharmacy_consultation', pharmacyId: pharmacyConfig.id, from: externalUserId });
 
         const done =
-          `Thank you. Your request has been passed to our pharmacist and someone will be in touch with you shortly.\n\n` +
-          `Anything else I can help with?\n\n1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
+          `Thank you, ${c.name.split(' ')[0]}. Here's what I've passed to our pharmacist:\n\n${summary}\n\n` +
+          `They'll be in touch to arrange your consultation.\n\n` +
+          `Is there anything else I can help you with?\n\n1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
         history.push({ role: 'assistant', content: done, timestamp: now });
-        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || null }, history, 'DONE');
+        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || c.name.split(' ')[0] || null }, history, 'DONE');
         return done;
       }
 
       // ════════════════════════════════════════════════════
-      // ENQUIRY FLOW
+      // ENQUIRY FLOW — capture the question plus a name + contact so staff can
+      // follow up. (Auto-answering simple questions from product data is not yet
+      // implemented — every enquiry is routed to a human.)
       // ════════════════════════════════════════════════════
       if (phase === 'enquiry_collect') {
-        if (!message || message.trim().length < 3) {
-          const ask = `Please type your question so I can pass it on.`;
-          history.push({ role: 'assistant', content: ask, timestamp: now });
+        const e   = state.enquiry || (state.enquiry = {});
+        const ans = (message || '').trim();
+        const awaiting = state.enquiry_awaiting;
+
+        if      (awaiting === 'question' && ans.length >= 3) e.question = ans;
+        else if (awaiting === 'name'     && ans.length >= 2) e.name     = ans;
+        else if (awaiting === 'contact'  && ans.length >= 3) e.contact  = ans;
+
+        const np = enquiryNextPrompt(e);
+        if (np) {
+          state.enquiry_awaiting = np.awaiting;
+          history.push({ role: 'assistant', content: np.prompt, timestamp: now });
           await saveConv(externalUserId, pharmacyConfig.id, state, history);
-          return ask;
+          return np.prompt;
         }
 
-        const question = message.trim();
+        state.enquiry_awaiting = null;
+        const summary = `Question: ${e.question}\nName: ${e.name}\nContact: ${e.contact}`;
         if (pharmacyConfig.handoff_number) {
           await sendWhatsApp(
             pharmacyConfig.handoff_number,
-            `*Pharmacy Enquiry*\n\nFrom: ${externalUserId}\nQuestion: ${question}`,
+            `*Pharmacy Enquiry*\n\n${summary}\n\nFrom: ${externalUserId}`,
             pharmacyConfig.phone_number_id
           );
         }
         io.emit('queue_updated', { type: 'pharmacy_enquiry', pharmacyId: pharmacyConfig.id });
 
         const done =
-          `Your question has been passed on. We will get back to you shortly.\n\n` +
-          `Anything else?\n\n1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
+          `Thanks, ${e.name.split(' ')[0]}. Your question has been passed to our team and we'll get back to you via ${e.contact} shortly.\n\n` +
+          `Is there anything else I can help you with?\n\n1. Place an order\n2. Book a consultation\n3. Make an enquiry`;
         history.push({ role: 'assistant', content: done, timestamp: now });
-        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || null }, history, 'DONE');
+        await saveConv(externalUserId, pharmacyConfig.id, { machine: 'DONE', recent_orders: state.recent_orders || [], customer_first_name: state.customer_first_name || e.name.split(' ')[0] || null }, history, 'DONE');
         return done;
       }
 
@@ -745,15 +867,27 @@ Populate extracted fields ONLY when you actually observed them in the customer m
       // ── PHASE: CONFIRM ──────────────────────────────────
       if (phase === 'confirm') {
         if (['yes', 'y', 'confirm', 'ok', 'sure', 'yep', 'yeah'].includes(msg)) {
-          const deliveryFeeConfig = pharmacyConfig.delivery_fee;
+          // Never complete a delivery order without an address and area — bounce
+          // back into detail collection rather than writing an unfulfillable order.
+          const del = state.delivery || {};
+          if (state.fulfilment === 'DELIVERY' && (!del.address || !del.area)) {
+            state.phase = 'delivery_details';
+            const np = deliveryNextPrompt(del, pharmacyConfig);
+            state.delivery_awaiting = np ? np.awaiting : null;
+            const reply = `Before I place the order I still need your delivery details. ${np ? np.prompt : ''}`.trim();
+            history.push({ role: 'assistant', content: reply, timestamp: now });
+            await saveConv(externalUserId, pharmacyConfig.id, state, history);
+            return reply;
+          }
+
           const { subtotal, fee, total } = buildOrderSummary(
-            state.cart, state.fulfilment, state.delivery_area, deliveryFeeConfig, currency
+            state.cart, state.fulfilment, state.delivery_area, pharmacyConfig, currency
           );
 
           const orderObj = {
             customer_id      : externalUserId,
-            customer_phone   : identity?.phone || externalUserId,
-            customer_name    : identity?.name  || state.customer_name || state.customer_first_name || null,
+            customer_phone   : del.phone || identity?.phone || externalUserId,
+            customer_name    : del.name  || identity?.name  || state.customer_name || state.customer_first_name || null,
             customer_email   : identity?.email || null,
             items            : state.cart.map(i => ({
               product_id : i.product_id,
@@ -762,11 +896,14 @@ Populate extracted fields ONLY when you actually observed them in the customer m
               qty        : i.qty,
             })),
             subtotal,
-            delivery_fee     : fee,
+            delivery_fee      : fee,
             total,
-            fulfilment       : state.fulfilment,
-            delivery_area    : state.delivery_area    || null,
-            prescription_url : state.prescription_url || null,
+            fulfilment        : state.fulfilment,
+            delivery_area     : del.area    || state.delivery_area || null,
+            delivery_address  : del.address || null,
+            delivery_city     : del.area    || null,
+            delivery_landmark : del.landmark || null,
+            prescription_url  : state.prescription_url || null,
           };
 
           let orderId;
@@ -851,73 +988,88 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
         // Unrecognised input while in confirm — re-show the summary
         const { msg: summaryMsg } = buildOrderSummary(
-          state.cart, state.fulfilment, state.delivery_area, pharmacyConfig.delivery_fee, currency
+          state.cart, state.fulfilment, state.delivery_area, pharmacyConfig, currency
         );
         history.push({ role: 'assistant', content: summaryMsg, timestamp: now });
         await saveConv(externalUserId, pharmacyConfig.id, state, history);
         return summaryMsg;
       }
 
-      // ── PHASE: DELIVERY ─────────────────────────────────
+      // ── PHASE: DELIVERY (choose fulfilment) ─────────────
       if (phase === 'delivery') {
-        // Hard keyword shortcuts first
-        if (!state.fulfilment) {
-          let resolved = null;
-          if (msg === '1' || msg.includes('deliver')) resolved = 'DELIVERY';
-          else if (msg === '2' || msg.includes('pickup') || msg.includes('pick up') || msg.includes('collect')) resolved = 'PICKUP';
+        let resolved = null;
+        if (msg === '1' || msg.includes('deliver')) resolved = 'DELIVERY';
+        else if (msg === '2' || msg.includes('pickup') || msg.includes('pick up') || msg.includes('collect')) resolved = 'PICKUP';
 
-          if (resolved) {
-            state.fulfilment = resolved;
-            if (resolved === 'PICKUP') {
-              state.phase = 'confirm';
-              const { msg: summaryMsg } = buildOrderSummary(state.cart, 'PICKUP', null, pharmacyConfig.delivery_fee, currency);
-              history.push({ role: 'assistant', content: summaryMsg, timestamp: now });
-              await saveConv(externalUserId, pharmacyConfig.id, state, history);
-              return summaryMsg;
-            }
-            const areaQ = `What area should we deliver to?`;
-            history.push({ role: 'assistant', content: areaQ, timestamp: now });
-            await saveConv(externalUserId, pharmacyConfig.id, state, history);
-            return areaQ;
-          }
-        }
-
-        if (state.fulfilment === 'DELIVERY' && !state.delivery_area) {
-          state.delivery_area = message.trim();
+        if (resolved === 'PICKUP') {
+          state.fulfilment = 'PICKUP';
           state.phase = 'confirm';
-          const { msg: summaryMsg } = buildOrderSummary(state.cart, 'DELIVERY', state.delivery_area, pharmacyConfig.delivery_fee, currency);
+          const { msg: summaryMsg } = buildOrderSummary(state.cart, 'PICKUP', null, pharmacyConfig, currency);
           history.push({ role: 'assistant', content: summaryMsg, timestamp: now });
           await saveConv(externalUserId, pharmacyConfig.id, state, history);
           return summaryMsg;
         }
 
-        // Ask AI for delivery intent disambiguation
-        const allProds = await adapter.getProducts();
-        const aiResp = await pharmacyAI(message, history.slice(-20), state, allProds, pharmacyConfig.pharmacy_name, state.recent_orders || []);
-
-        if (aiResp.extracted?.fulfilment && !state.fulfilment) {
-          state.fulfilment = aiResp.extracted.fulfilment.toUpperCase();
-          if (state.fulfilment === 'PICKUP') {
-            state.phase = 'confirm';
-            const { msg: summaryMsg } = buildOrderSummary(state.cart, 'PICKUP', null, pharmacyConfig.delivery_fee, currency);
-            history.push({ role: 'assistant', content: summaryMsg, timestamp: now });
-            await saveConv(externalUserId, pharmacyConfig.id, state, history);
-            return summaryMsg;
-          }
-        }
-        if (aiResp.extracted?.delivery_area && state.fulfilment === 'DELIVERY' && !state.delivery_area) {
-          state.delivery_area = aiResp.extracted.delivery_area;
-          state.phase = 'confirm';
-          const { msg: summaryMsg } = buildOrderSummary(state.cart, 'DELIVERY', state.delivery_area, pharmacyConfig.delivery_fee, currency);
-          history.push({ role: 'assistant', content: summaryMsg, timestamp: now });
+        if (resolved === 'DELIVERY') {
+          state.fulfilment = 'DELIVERY';
+          state.phase = 'delivery_details';
+          // Reuse any details already collected (e.g. after a cancelled confirm);
+          // prefill name/phone from the verified Supabase user when logged in.
+          const d = state.delivery || (state.delivery = {});
+          if (!d.name  && identity?.name)  d.name  = identity.name;
+          if (!d.phone && identity?.phone) d.phone = identity.phone;
+          const np = deliveryNextPrompt(d, pharmacyConfig);
+          state.delivery_awaiting = np ? np.awaiting : null;
+          const ask = np ? np.prompt : `Where should we deliver to?`;
+          history.push({ role: 'assistant', content: ask, timestamp: now });
           await saveConv(externalUserId, pharmacyConfig.id, state, history);
-          return summaryMsg;
+          return ask;
         }
 
-        const fallback = aiResp.reply || `How would you like to receive your order?\n\n1. Delivery\n2. Pickup`;
+        const fallback = `How would you like to receive your order?\n\n1. Delivery\n2. Pickup`;
         history.push({ role: 'assistant', content: fallback, timestamp: now });
         await saveConv(externalUserId, pharmacyConfig.id, state, history);
         return fallback;
+      }
+
+      // ── PHASE: DELIVERY_DETAILS (collect name/phone/address/area/landmark) ──
+      if (phase === 'delivery_details') {
+        const d   = state.delivery || (state.delivery = {});
+        const ans = (message || '').trim();
+        const awaiting = state.delivery_awaiting;
+
+        // Record the answer to whatever field we last asked for. A blank/invalid
+        // answer leaves the field unset, so deliveryNextPrompt re-asks it.
+        if      (awaiting === 'name'    && ans.length >= 2)                 d.name    = ans;
+        else if (awaiting === 'phone'   && ans.replace(/\D/g, '').length >= 7) d.phone = ans;
+        else if (awaiting === 'address' && ans.length >= 6)                 d.address = ans;
+        else if (awaiting === 'area'    && ans.length >= 2)                 d.area    = ans;
+        else if (awaiting === 'landmark') {
+          d.landmark = /^(skip|no|none|n)$/i.test(ans) ? null : (ans || null);
+          d.landmark_asked = true;
+        }
+
+        const np = deliveryNextPrompt(d, pharmacyConfig);
+        if (np) {
+          state.delivery_awaiting = np.awaiting;
+          history.push({ role: 'assistant', content: np.prompt, timestamp: now });
+          await saveConv(externalUserId, pharmacyConfig.id, state, history);
+          return np.prompt;
+        }
+
+        // All details collected → resolve the zone fee and show the summary.
+        state.delivery_area     = d.area;
+        state.delivery_awaiting = null;
+        state.phase             = 'confirm';
+        const zone = resolveDeliveryFee(d.area, pharmacyConfig);
+        const { msg: summaryMsg } = buildOrderSummary(state.cart, 'DELIVERY', d.area, pharmacyConfig, currency);
+        const lead = zone.matched
+          ? `Got it — delivering to ${d.area}.`
+          : `Got it. We'll deliver to ${d.area}.`;
+        const reply = `${lead}\n\n${summaryMsg}`;
+        history.push({ role: 'assistant', content: reply, timestamp: now });
+        await saveConv(externalUserId, pharmacyConfig.id, state, history);
+        return reply;
       }
 
       // ── PHASE: MORE_OR_CHECKOUT ──────────────────────────
