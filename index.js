@@ -2092,30 +2092,31 @@ app.get('/api/admin/fix-clinic-tenant', adminAuth, async (req, res) => {
     await pool.query(`ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS phone_number_id VARCHAR(50)`);
     await pool.query(`ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
 
-    const { rows: [{ n }] } = await pool.query('SELECT COUNT(*)::int AS n FROM clinic_config');
+    const PHONE = '1132724323258409';
+    const setId = req.query.set;
 
-    let upd;
-    if (n === 0) {
-      // No config row at all — create one so tenant resolution can find the clinic
-      upd = await pool.query(
-        `INSERT INTO clinic_config (clinic_name, agent_name, phone_number_id, active)
-         VALUES ('Our Clinic', 'Zero', '1132724323258409', true)
-         RETURNING id, clinic_name, phone_number_id, active`
-      );
-    } else {
-      // Don't depend on id = 1; target the unconfigured clinic row(s) without
-      // clobbering any other tenant that already has its own number set
-      upd = await pool.query(
-        `UPDATE clinic_config SET phone_number_id = '1132724323258409', active = true
-         WHERE phone_number_id IS NULL OR phone_number_id = '1132724323258409'
-         RETURNING id, clinic_name, phone_number_id, active`
-      );
+    if (!setId) {
+      // INSPECT MODE: list rows so we can identify the real clinic before mutating.
+      // clinic_config has a UNIQUE index on phone_number_id, so only one row may hold it.
+      const { rows } = await pool.query('SELECT * FROM clinic_config ORDER BY id');
+      return res.json({
+        mode: 'inspect',
+        count: rows.length,
+        clinic_config: rows,
+        hint: `Call again with ?set=<id> to assign ${PHONE} to that clinic row.`
+      });
     }
 
-    const { rows: clinic_config } = await pool.query(
-      'SELECT id, clinic_name, phone_number_id, active FROM clinic_config ORDER BY id'
+    // SET MODE: assign the WhatsApp number to one specific row.
+    // Clear it from any other row first to respect the unique constraint.
+    await pool.query('UPDATE clinic_config SET phone_number_id = NULL WHERE phone_number_id = $1 AND id <> $2', [PHONE, setId]);
+    const upd = await pool.query(
+      `UPDATE clinic_config SET phone_number_id = $1, active = true WHERE id = $2
+       RETURNING id, clinic_name, phone_number_id, active`,
+      [PHONE, setId]
     );
-    res.json({ success: true, rows_affected: upd.rowCount, clinic_config });
+    const { rows: clinic_config } = await pool.query('SELECT id, clinic_name, phone_number_id, active FROM clinic_config ORDER BY id');
+    res.json({ success: true, rows_affected: upd.rowCount, updated: upd.rows, clinic_config });
   } catch (error) {
     res.json({ error: error.message });
   }
