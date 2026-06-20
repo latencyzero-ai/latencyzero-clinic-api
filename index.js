@@ -2075,12 +2075,15 @@ app.patch('/api/admin/clinic', adminAuth, async (req, res) => {
     const updates = Object.keys(fields).filter(k => allowedFields.includes(k));
     if (updates.length === 0) return res.status(400).json({ error: 'No valid fields provided' });
 
+    // Target a specific clinic row (multi-tenant). Defaults to id=1 for back-compat.
+    const targetId = parseInt(req.query.id || fields.id || 1, 10);
     const setClauses = updates.map((k, i) => `${k} = $${i + 1}`).join(', ');
     const values = updates.map(k => fields[k]);
-    await pool.query(`UPDATE clinic_config SET ${setClauses} WHERE id = 1`, values);
+    values.push(targetId);
+    await pool.query(`UPDATE clinic_config SET ${setClauses} WHERE id = $${values.length}`, values);
 
-    addLog('info', 'Admin updated clinic config', JSON.stringify(updates));
-    const updated = await pool.query('SELECT * FROM clinic_config LIMIT 1');
+    addLog('info', `Admin updated clinic config (id=${targetId})`, JSON.stringify(updates));
+    const updated = await pool.query('SELECT * FROM clinic_config WHERE id = $1', [targetId]);
     res.json({ success: true, config: updated.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
