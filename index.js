@@ -187,7 +187,11 @@ async function getNextQueueNumber(clinicId) {
 }
 
 // ─── SEND WHATSAPP VIA META ───────────────────────────
-async function sendWhatsApp(to, message, phoneNumberId = PHONE_NUMBER_ID, accessToken = ACCESS_TOKEN) {
+async function sendWhatsApp(to, message, phoneNumberId, accessToken) {
+  // Coalesce null/empty per-tenant values to the global env credentials.
+  // (Default params don't cover null — only undefined — so handle it explicitly.)
+  phoneNumberId = phoneNumberId || PHONE_NUMBER_ID;
+  accessToken = accessToken || ACCESS_TOKEN;
   try {
     const cleanPhone = to.replace(/[^0-9]/g, '');
     await axios.post(
