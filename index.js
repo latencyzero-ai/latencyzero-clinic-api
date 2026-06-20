@@ -2089,12 +2089,33 @@ app.patch('/api/admin/clinic', adminAuth, async (req, res) => {
 
 app.get('/api/admin/fix-clinic-tenant', adminAuth, async (req, res) => {
   try {
-    await pool.query(`
-      ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS phone_number_id VARCHAR(50);
-      ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true;
-      UPDATE clinic_config SET phone_number_id = '1132724323258409', active = true WHERE id = 1;
-    `);
-    res.json({ success: true });
+    await pool.query(`ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS phone_number_id VARCHAR(50)`);
+    await pool.query(`ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true`);
+
+    const { rows: [{ n }] } = await pool.query('SELECT COUNT(*)::int AS n FROM clinic_config');
+
+    let upd;
+    if (n === 0) {
+      // No config row at all — create one so tenant resolution can find the clinic
+      upd = await pool.query(
+        `INSERT INTO clinic_config (clinic_name, agent_name, phone_number_id, active)
+         VALUES ('Our Clinic', 'Zero', '1132724323258409', true)
+         RETURNING id, clinic_name, phone_number_id, active`
+      );
+    } else {
+      // Don't depend on id = 1; target the unconfigured clinic row(s) without
+      // clobbering any other tenant that already has its own number set
+      upd = await pool.query(
+        `UPDATE clinic_config SET phone_number_id = '1132724323258409', active = true
+         WHERE phone_number_id IS NULL OR phone_number_id = '1132724323258409'
+         RETURNING id, clinic_name, phone_number_id, active`
+      );
+    }
+
+    const { rows: clinic_config } = await pool.query(
+      'SELECT id, clinic_name, phone_number_id, active FROM clinic_config ORDER BY id'
+    );
+    res.json({ success: true, rows_affected: upd.rowCount, clinic_config });
   } catch (error) {
     res.json({ error: error.message });
   }
