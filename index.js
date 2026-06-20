@@ -2087,6 +2087,19 @@ app.patch('/api/admin/clinic', adminAuth, async (req, res) => {
   }
 });
 
+app.get('/api/admin/fix-clinic-tenant', adminAuth, async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS phone_number_id VARCHAR(50);
+      ALTER TABLE clinic_config ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT true;
+      UPDATE clinic_config SET phone_number_id = '1132724323258409', active = true WHERE id = 1;
+    `);
+    res.json({ success: true });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
+
 app.post('/api/admin/message', adminAuth, async (req, res) => {
   try {
     const { to, message } = req.body;
