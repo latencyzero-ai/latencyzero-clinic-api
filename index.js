@@ -2078,7 +2078,11 @@ app.patch('/api/admin/clinic', adminAuth, async (req, res) => {
     // Target a specific clinic row (multi-tenant). Defaults to id=1 for back-compat.
     const targetId = parseInt(req.query.id || fields.id || 1, 10);
     const setClauses = updates.map((k, i) => `${k} = $${i + 1}`).join(', ');
-    const values = updates.map(k => fields[k]);
+    // services is a jsonb column here — stringify arrays/objects so jsonb accepts them
+    const values = updates.map(k => {
+      const v = fields[k];
+      return (v !== null && typeof v === 'object') ? JSON.stringify(v) : v;
+    });
     values.push(targetId);
     await pool.query(`UPDATE clinic_config SET ${setClauses} WHERE id = $${values.length}`, values);
 
