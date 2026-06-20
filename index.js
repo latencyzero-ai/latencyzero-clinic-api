@@ -2749,7 +2749,7 @@ app.get('/widget/:widgetKey.js', async (req, res) => {
   function GREETING_RETURNING(){ return "Hi, I'm " + AGENT_NAME + " — welcome back to " + NAME + ". How can I help?"; }
 
   var css = \`
-    #_zw{position:fixed;bottom:24px;right:0;z-index:2147483647;font-family:${FONT};font-size:14px}
+    #_zw{position:fixed;bottom:2rem;right:2rem;z-index:2147483647;font-family:${FONT};font-size:14px}
     #_zw *{box-sizing:border-box}
     #_zw button,#_zw input,#_zw textarea{margin:0;font-family:inherit}
     #_zw-btn{width:56px;height:56px;border-radius:50%;background:${ACCENT};border:none;cursor:pointer;
