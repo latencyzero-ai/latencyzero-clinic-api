@@ -414,7 +414,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
   // ── ORDER SUMMARY ─────────────────────────────────────────────────────────
   // All arithmetic in server code — never in the LLM.
 
-  function buildOrderSummary(cart, fulfilment, deliveryArea, pharmacyConfig, currency) {
+  function buildOrderSummary(cart, fulfilment, deliveryArea, pharmacyConfig, currency, delivery) {
     const subtotal = cart.reduce((s, i) => s + i.price_snap * i.qty, 0);
     const fee      = fulfilment === 'DELIVERY'
       ? resolveDeliveryFee(deliveryArea, pharmacyConfig).fee
@@ -429,7 +429,21 @@ Populate extracted fields ONLY when you actually observed them in the customer m
     msg += fulfilment === 'DELIVERY'
       ? `Delivery${deliveryArea ? ' to ' + deliveryArea : ''}: ${formatCurrency(fee, currency)}\n`
       : `Fulfilment: Pickup\n`;
-    msg += `Total: ${formatCurrency(total, currency)}\n\nReply YES to confirm or NO to cancel.`;
+    msg += `Total: ${formatCurrency(total, currency)}\n`;
+
+    // Echo the collected delivery details so the customer verifies name / phone /
+    // address before confirming — and can catch a wrong entry (e.g. an area typed
+    // into the name field). Reply *edit* re-collects them.
+    if (fulfilment === 'DELIVERY' && delivery) {
+      const d = delivery;
+      const areaLine = [d.area, d.landmark].filter(Boolean).join(' — ');
+      const details  = [d.name, d.phone, d.address, areaLine].filter(Boolean);
+      if (details.length) msg += `\nDeliver to:\n${details.join('\n')}\n`;
+    }
+
+    msg += fulfilment === 'DELIVERY'
+      ? `\nReply YES to confirm, *edit* to change delivery details, or NO to cancel.`
+      : `\nReply YES to confirm or NO to cancel.`;
 
     return { msg, subtotal, fee, total };
   }
@@ -866,6 +880,21 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
       // ── PHASE: CONFIRM ──────────────────────────────────
       if (phase === 'confirm') {
+        // Let the customer correct delivery details before confirming (e.g. a
+        // wrong name). Re-collects from the start, keeping verified identity.
+        if (msg === 'edit' && state.fulfilment === 'DELIVERY') {
+          state.phase    = 'delivery_details';
+          const d = state.delivery = {};
+          if (identity?.name)  d.name  = identity.name;
+          if (identity?.phone) d.phone = identity.phone;
+          const np = deliveryNextPrompt(d, pharmacyConfig);
+          state.delivery_awaiting = np ? np.awaiting : null;
+          const reply = `No problem — let's update your delivery details. ${np ? np.prompt : ''}`.trim();
+          history.push({ role: 'assistant', content: reply, timestamp: now });
+          await saveConv(externalUserId, pharmacyConfig.id, state, history);
+          return reply;
+        }
+
         if (['yes', 'y', 'confirm', 'ok', 'sure', 'yep', 'yeah'].includes(msg)) {
           // Never complete a delivery order without an address and area — bounce
           // back into detail collection rather than writing an unfulfillable order.
@@ -988,7 +1017,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
 
         // Unrecognised input while in confirm — re-show the summary
         const { msg: summaryMsg } = buildOrderSummary(
-          state.cart, state.fulfilment, state.delivery_area, pharmacyConfig, currency
+          state.cart, state.fulfilment, state.delivery_area, pharmacyConfig, currency, state.delivery
         );
         history.push({ role: 'assistant', content: summaryMsg, timestamp: now });
         await saveConv(externalUserId, pharmacyConfig.id, state, history);
@@ -1062,7 +1091,7 @@ Populate extracted fields ONLY when you actually observed them in the customer m
         state.delivery_awaiting = null;
         state.phase             = 'confirm';
         const zone = resolveDeliveryFee(d.area, pharmacyConfig);
-        const { msg: summaryMsg } = buildOrderSummary(state.cart, 'DELIVERY', d.area, pharmacyConfig, currency);
+        const { msg: summaryMsg } = buildOrderSummary(state.cart, 'DELIVERY', d.area, pharmacyConfig, currency, d);
         const lead = zone.matched
           ? `Got it — delivering to ${d.area}.`
           : `Got it. We'll deliver to ${d.area}.`;
